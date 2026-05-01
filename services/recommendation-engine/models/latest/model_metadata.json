@@ -1,0 +1,12 @@
+{
+  "version": "1.0.0-seed",
+  "trained_at": "1970-01-01T00:00:00Z",
+  "framework": "scikit-learn",
+  "framework_version": "1.4.0",
+  "embedding_dim": 128,
+  "top_k_default": 20,
+  "metric": "cosine",
+  "training_dataset_hash": "sha256:PLACEHOLDER",
+  "checksum": "sha256:PLACEHOLDER",
+  "notes": "Placeholder metadata for the greenfield initial commit. Replace with real values when promoting a trained model."
+}
