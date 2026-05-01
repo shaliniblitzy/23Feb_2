@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://payment-service.local/schemas/payment_failed.json",
+  "title": "PaymentFailed",
+  "description": "Event emitted by the Payment Service when a charge attempt fails terminally (e.g., card declined). Triggers Order Service saga compensation per AAP R-18.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "event_type",
+    "event_version",
+    "occurred_at",
+    "payment_id",
+    "order_id",
+    "customer_id",
+    "amount",
+    "currency",
+    "provider",
+    "correlation_id"
+  ],
+  "properties": {
+    "event_id": {"type": "string", "format": "uuid"},
+    "event_type": {"type": "string", "const": "PaymentFailed"},
+    "event_version": {"type": "integer", "minimum": 1, "const": 1},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "payment_id": {"type": "string", "format": "uuid"},
+    "order_id": {"type": "string", "format": "uuid"},
+    "customer_id": {"type": "string", "format": "uuid"},
+    "amount": {"type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?$"},
+    "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
+    "provider": {"type": "string", "enum": ["stripe", "razorpay"]},
+    "error_code": {
+      "type": ["string", "null"],
+      "description": "Provider error code (e.g., card_declined, insufficient_funds)."
+    },
+    "error_message": {
+      "type": ["string", "null"],
+      "maxLength": 512,
+      "description": "Sanitized human-readable description (no PII)."
+    },
+    "correlation_id": {"type": "string"}
+  }
+}
