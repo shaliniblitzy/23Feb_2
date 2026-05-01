@@ -1,0 +1,242 @@
+# =============================================================================
+# Recommendation Engine — Default Configuration (Base Layer)
+# =============================================================================
+# Loaded FIRST by pydantic-settings at service startup (see ../src/config/
+# settings.py). Environment-specific files (e.g., local.yaml) are merged on
+# top; environment variables take ultimate precedence.
+#
+# Loading precedence (lowest → highest):
+#   1. default.yaml           (this file — base layer)
+#   2. <ENVIRONMENT>.yaml     (e.g., local.yaml for ENVIRONMENT=local)
+#   3. environment variables  (highest — see ../.env.example)
+#
+# SECURITY (AAP R-25): This file contains NO secrets. Any value that must
+# reference a secret uses the `<name>_env` convention naming an env var to
+# be resolved at runtime (example: `base_url_env: PRODUCT_SERVICE_URL`).
+#
+# CROSS-FILE COUPLING:
+#   * database.vector.embedding_dim MUST equal model.embedding_dim MUST equal
+#     the `vector(N)` dimension in ../migrations/V002__create_embeddings_table.sql
+#     (all three: 128 today).
+#   * Topic names below MUST match the event names declared in
+#     ../../../docs/architecture/event-catalog.md.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 1. service — process identity, port, environment classifier
+# -----------------------------------------------------------------------------
+service:
+  name: recommendation-engine              # logical service name; used in logs (AAP R-26 service field)
+  version: 1.0.0                           # bumped on every backward-incompatible change
+  port: 8000                               # HTTP listen port; MUST match Dockerfile EXPOSE and .env.example SERVICE_PORT
+  environment: local                       # overridden by ENVIRONMENT env var; values: local | dev | stage | prod
+
+
+# -----------------------------------------------------------------------------
+# 2. logging — structured JSON log shape (AAP R-26)
+# -----------------------------------------------------------------------------
+logging:
+  level: INFO                              # overridden by LOG_LEVEL env var; values: DEBUG | INFO | WARN | ERROR
+  format: json                             # MUST remain "json" (AAP R-26 — structured JSON logs)
+  include_fields:                          # AAP R-26 — required log fields
+    - timestamp
+    - level
+    - service
+    - correlation_id
+    - user_id
+    - route
+    - method
+    - status
+    - latency_ms
+    - message
+
+
+# -----------------------------------------------------------------------------
+# 3. database — pgvector / PostgreSQL (AAP Section 0.4.4)
+# -----------------------------------------------------------------------------
+# COUPLING NOTE: database.vector.embedding_dim MUST equal model.embedding_dim
+# AND the `vector(N)` dimension in ../migrations/V002__create_embeddings_table.sql
+# (all three are 128 today). A mismatch breaks inference at the type boundary.
+database:
+  driver: postgresql+pgvector              # SQLAlchemy-style driver spec used by the psycopg3 + pgvector layer
+  pool:
+    min_size: 1                            # minimum idle connections kept warm in the pool
+    max_size: 10                           # upper bound on concurrent connections per instance
+    connect_timeout_ms: 3000               # TCP connect timeout to PostgreSQL
+    statement_timeout_ms: 3000             # enforced server-side via SET statement_timeout
+  vector:
+    embedding_dim: 128                     # COUPLING: must match model.embedding_dim AND migrations/V002 vector(128)
+    similarity_op: cosine                  # pgvector operator; cosine = <=> ; alternatives: inner_product <#>, L2 <->
+
+
+# -----------------------------------------------------------------------------
+# 4. cache — Redis (AAP Section 0.4.4)
+# -----------------------------------------------------------------------------
+cache:
+  driver: redis
+  default_ttl_seconds: 600                 # 10-minute cache for recommendations
+  namespaces:
+    recommendations: "reco:user:"          # key prefix for cached reco lists
+    product_metadata: "prod:meta:"         # key prefix for Product Service hydration fallback
+  connect_timeout_ms: 2000                 # before Redis is treated as unavailable -> degrade (AAP R-20)
+
+
+# -----------------------------------------------------------------------------
+# 5. kafka — async event consumption (AAP R-14, R-17, R-30)
+# -----------------------------------------------------------------------------
+# The consume topic list is AUTHORITATIVE — it MUST contain exactly the 6 topics
+# from AAP Section 0.5.2.2 bullet 9 (Recommendation Engine consumes
+# product.*, order.*, user.*). The produce list MUST stay empty: this service
+# is a TERMINAL CONSUMER and emits no Kafka events.
+kafka:
+  client_id: recommendation-engine
+  consumer_group: recommendation-engine
+  auto_offset_reset: earliest              # start from oldest offset for new consumer groups
+  enable_auto_commit: false                # AAP at-least-once: commit only after successful handler completion
+  max_poll_records: 100                    # batch size per poll
+  session_timeout_ms: 45000
+  heartbeat_interval_ms: 15000
+  topics:
+    consume:
+      - product.created                    # refresh embedding for new product
+      - product.updated                    # re-embed mutated product; invalidate metadata cache
+      - order.created                      # weak interaction signal -> update user profile draft
+      - order.fulfilled                    # strong interaction signal -> popularity counter
+      - user.registered                    # cold-start profile bootstrap
+      - user.updated                       # re-embed mutated user preferences
+    produce: []                            # TERMINAL CONSUMER — service emits no Kafka events (AAP Section 0.5.2.2 bullet 9)
+  retry:                                   # AAP R-17 — retry + DLQ
+    topic_suffix: ".retry"
+    dlq_suffix: ".dlq"
+    max_attempts: 3
+    backoff_ms: 500                        # initial backoff; multiplier is fixed at 2.0 in application code
+    max_backoff_ms: 8000
+  schema_registry:
+    url_env: SCHEMA_REGISTRY_URL           # AAP R-14 — resolved from env var at runtime
+    serializer: json_schema                # values: json_schema | avro
+
+
+# -----------------------------------------------------------------------------
+# 6. product_service_client — sync HTTP client (AAP Section 0.4.2, R-15, R-16)
+# -----------------------------------------------------------------------------
+product_service_client:
+  base_url_env: PRODUCT_SERVICE_URL        # resolved from env var at runtime (AAP R-25 — no URL baked in)
+  connect_timeout_ms: 1000
+  read_timeout_ms: 2000
+  retry:                                   # AAP R-15 — exponential backoff + jitter, bounded attempts
+    max_attempts: 3
+    initial_delay_ms: 100
+    multiplier: 2.0
+    max_delay_ms: 2000
+    jitter_pct: 25
+  circuit_breaker:                         # AAP R-16 — failure-rate breaker with half-open probe
+    failure_rate_threshold_pct: 50
+    call_volume_threshold: 20
+    open_duration_ms: 30000
+    half_open_permitted_calls: 1
+
+
+# -----------------------------------------------------------------------------
+# 7. auth — JWT validation only (AAP R-21, R-22)
+# -----------------------------------------------------------------------------
+# This service VALIDATES JWTs but never issues them (AAP R-21). Public keys
+# are fetched at runtime from the Auth Service's JWKS endpoint and cached
+# with a bounded TTL (AAP R-22).
+auth:
+  jwt:
+    public_key_url_env: JWT_PUBLIC_KEY_URL       # JWKS endpoint — AAP R-22
+    jwks_cache_ttl_seconds: 3600                 # bounded TTL cache for JWKS (AAP R-22)
+    issuer_env: JWT_ISSUER                       # expected iss claim
+    audience: recommendation-engine              # expected aud claim for this service (matches service.name)
+    algorithms:
+      - RS256
+      - ES256
+    clock_skew_seconds: 30                       # tolerate mild clock drift
+  public_routes:                                 # routes NOT requiring a JWT
+    - /health/live
+    - /health/ready
+    - /metrics
+
+
+# -----------------------------------------------------------------------------
+# 8. model — ML inference runtime
+# -----------------------------------------------------------------------------
+# COUPLING NOTE: embedding_dim MUST equal database.vector.embedding_dim AND
+# the `vector(N)` dimension in ../migrations/V002__create_embeddings_table.sql.
+# A mismatch breaks inference at the type boundary.
+model:
+  path_env: MODEL_PATH                           # default runtime path: ./models/latest (resolved from env)
+  embedding_dim: 128                             # COUPLING: must match database.vector.embedding_dim AND migrations/V002
+  top_k_default: 20                              # default recommendation list size
+  top_k_max: 100                                 # hard cap on client-requested top_k
+  warmup_on_startup: true                        # AAP R-19 — run dummy inference before accepting traffic
+  reload_endpoint_enabled: false                 # internal-only hot reload; disabled in default config
+  versions_to_keep: 2                            # local filesystem retention of prior model versions
+
+
+# -----------------------------------------------------------------------------
+# 9. fallback — three-tier fallback chain (AAP R-20, Section 0.4.2)
+# -----------------------------------------------------------------------------
+# Three-tier fallback: ML inference -> Redis cache -> popularity-based (rec_cache).
+# AAP Section 0.4.2 calls out "ML miss -> popularity fallback" as a first-class
+# requirement; this section is the canonical declaration for this service.
+fallback:
+  cache_enabled: true
+  popularity_enabled: true
+  min_inference_confidence: 0.3                  # below this score -> use cache; if cache miss -> popularity
+  popularity_refresh_interval_seconds: 300       # refresh cadence for rec_cache popularity window
+  popularity_window_days: 30                     # rolling window for computing popularity ranking
+  default_list_size: 10                          # size of returned list when falling back
+
+
+# -----------------------------------------------------------------------------
+# 10. resilience — shared retry / circuit-breaker defaults (AAP R-15, R-16)
+# -----------------------------------------------------------------------------
+# These serve as defaults inherited when a specific client/section omits its own
+# retry / circuit_breaker block. Per-call-site overrides take precedence.
+resilience:
+  retry_default:                                 # AAP R-15
+    max_attempts: 3
+    initial_delay_ms: 100
+    multiplier: 2.0
+    max_delay_ms: 2000
+    jitter_pct: 25
+  circuit_breaker_default:                       # AAP R-16
+    failure_rate_threshold_pct: 50
+    call_volume_threshold: 20
+    open_duration_ms: 30000
+    half_open_permitted_calls: 1
+
+
+# -----------------------------------------------------------------------------
+# 11. observability — Prometheus + OpenTelemetry (AAP R-26, R-27)
+# -----------------------------------------------------------------------------
+observability:
+  prometheus:
+    enabled: true
+    port: 9090                                   # /metrics endpoint port (scraped by Metricbeat per AAP R-27)
+    path: /metrics
+  otel:
+    enabled: false                               # flip to true when OTEL collector is reachable (stage/prod)
+    service_name: recommendation-engine
+
+
+# -----------------------------------------------------------------------------
+# 12. http — outbound HTTP client defaults
+# -----------------------------------------------------------------------------
+http:
+  cors:
+    enabled: true
+    allowed_origins: []                          # prod: set via env or K8s ConfigMap; local: overridden in local.yaml
+  user_agent: "recommendation-engine/1.0"
+  request_timeout_seconds: 10
+
+
+# =============================================================================
+# END OF DEFAULT CONFIGURATION
+# -----------------------------------------------------------------------------
+# Next loading step: pydantic-settings merges <ENVIRONMENT>.yaml on top of
+# this file, then applies env-var overrides. See ../.env.example for the full
+# env-var catalog and ./README.md for precedence rules.
+# =============================================================================
