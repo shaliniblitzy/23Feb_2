@@ -1,0 +1,76 @@
+-- =============================================================================
+-- V001__enable_pgvector_extension.sql
+-- =============================================================================
+-- Enables the pgvector extension in the Recommendation Engine's private
+-- PostgreSQL database. Must run FIRST because subsequent migrations define
+-- vector(N) columns and HNSW indexes, both of which require this extension.
+--
+-- pgvector is an open-source PostgreSQL extension that adds:
+--   * The `vector` data type (and `halfvec`, `sparsevec`, etc. in newer versions)
+--   * Distance operators: <-> (L2), <#> (negative inner product), <=> (cosine)
+--   * Index access methods: `ivfflat` and (pgvector >= 0.5.0) `hnsw`
+--
+-- Installation requirement:
+--   The PostgreSQL instance must have the pgvector extension package
+--   installed at the OS level (shared_preload_libraries OR package install).
+--   The recommended Docker image is `pgvector/pgvector:pg16`, which ships
+--   with pgvector pre-installed; for self-managed Postgres, install via
+--   your package manager:
+--
+--       apt install postgresql-16-pgvector
+--
+--   See https://github.com/pgvector/pgvector for platform-specific install.
+--
+-- Permissions:
+--   CREATE EXTENSION requires superuser OR the user granted CREATE on the
+--   database AND with the pg_read_server_files role on some distributions.
+--   Managed services (RDS, Cloud SQL, Azure Database) expose extension
+--   installation via a specific workflow; see provider docs.
+--
+--     * AWS RDS PostgreSQL ........ enable via the `rds.extensions` parameter
+--                                   group entry, then run `CREATE EXTENSION`.
+--     * GCP Cloud SQL PostgreSQL .. enable via the Cloud SQL console flag list
+--                                   or `cloudsql.enable_pgvector`.
+--     * Azure Database for PostgreSQL
+--                                   enable `vector` in the server-parameter
+--                                   `azure.extensions` allow-list.
+--
+-- AAP References:
+--   * AAP Section 0.4.4 -- Vector store for Recommendation Engine
+--   * AAP Section 0.3.1 -- pgvector referenced as the vector store option
+--   * AAP R-6 -- Database per service (this extension is local to this DB)
+--   * AAP R-7 -- Polyglot persistence: vector store + Redis
+--   * AAP R-9 -- Migrations in owning service folder, applied automatically
+--
+-- Dependencies:
+--   NONE. This is the first migration.
+--
+-- Downstream effects:
+--   * V002 defines `embedding vector(128)` column
+--   * V005 creates an HNSW index on the vector column
+--
+-- Idempotence:
+--   Uses IF NOT EXISTS so reapplication is a no-op. The extension is
+--   created at the database level; running this against a DB where it is
+--   already enabled succeeds silently.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- Enable pgvector
+-- -----------------------------------------------------------------------------
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- =============================================================================
+-- END V001
+-- -----------------------------------------------------------------------------
+-- Verification:
+--     SELECT extname, extversion
+--     FROM pg_extension
+--     WHERE extname = 'vector';
+--
+-- Expected output: one row with extname = 'vector' and an extversion column
+-- showing something like '0.5.1' or newer.
+--
+-- Next migration: V002__create_embeddings_table.sql (uses the vector type
+-- enabled here).
+-- =============================================================================
