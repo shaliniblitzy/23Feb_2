@@ -1,0 +1,375 @@
+# =============================================================================
+# Payment Service — Python Dependencies
+# =============================================================================
+# Target runtime  : Python 3.11+
+# Service domain  : Dual-provider (Stripe + Razorpay) payment processing
+#                   service. Implements the PaymentProvider adapter layer,
+#                   webhook signature verification, idempotency-key store,
+#                   envelope-encryption helpers (encryption at rest), and the
+#                   Kafka producer for payment.succeeded / payment.failed /
+#                   payment.refunded events.
+# Source of truth : Agent Action Plan (AAP) Section 0.3.1 (public packages),
+#                   Section 0.3.3 (dependency updates), Section 0.4.2
+#                   (Stripe + Razorpay external integrations + retries +
+#                   provider failover), Section 0.4.4 (payment_db PostgreSQL
+#                   schema with the five tables: payments,
+#                   payment_attempts, refunds, provider_webhooks,
+#                   idempotency_keys), and applicable rules R-8 (encryption
+#                   at rest + idempotency key store), R-10 (dual-provider
+#                   concurrent integration behind PaymentProvider), R-12
+#                   (HMAC webhook signature verification + idempotent
+#                   webhook processing), R-14 (Schema Registry), R-15
+#                   (retry with exponential backoff + jitter), R-16
+#                   (circuit breaker), R-17 (DLQ / retry topics), R-21 /
+#                   R-22 (JWT validation with bounded TTL JWKS cache),
+#                   R-26 / R-27 (structured JSON logs shipped via Beats to
+#                   Logstash), R-30 (event naming conventions).
+#
+# Pinning policy  : Every package carries a lower bound (>=) and an upper
+#                   bound (<) excluding the next major version. This permits
+#                   safe patch / minor upgrades while preventing breaking
+#                   major-version drift. No package is left bare; no `==`
+#                   pinning is used unless accompanied by a "# pin: <reason>"
+#                   comment.
+#
+# Ordering        : Grouped by concern, alphabetized within each group for
+#                   deterministic diffs. Runtime dependencies appear first;
+#                   testing (dev) dependencies are gathered at the bottom
+#                   under the "Testing (dev)" banner.
+#
+# Install         : python -m pip install -r requirements.txt
+# Compile wheels  : pip wheel -r requirements.txt -w /tmp/wheels
+# Audit CVEs      : pip-audit -r requirements.txt
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Web Framework & ASGI Server
+# -----------------------------------------------------------------------------
+# FastAPI exposes the synchronous payment endpoints — POST /payments
+# (charge), POST /payments/{id}/refunds, POST /webhooks/stripe,
+# POST /webhooks/razorpay, GET /health/live, GET /health/ready, GET /metrics
+# — and auto-generates the OpenAPI document referenced by the API Gateway
+# and `docs/api/*` per AAP Section 0.3.1 (OpenAPI tooling). The webhook
+# handlers MUST receive the raw request body for HMAC signature
+# verification (AAP R-12), which FastAPI exposes via Request.body().
+# uvicorn[standard] adds uvloop + httptools for production throughput.
+# Pydantic v2 powers request/response validation; pydantic-settings drives
+# 12-factor environment-variable configuration loading.
+# -----------------------------------------------------------------------------
+fastapi>=0.110.0,<1.0.0                                    # AAP Section 0.3.1 — OpenAPI tooling / sync HTTP entrypoints
+pydantic>=2.6.0,<3.0.0                                     # Request / response model validation (FastAPI v2 stack)
+pydantic-settings>=2.2.0,<3.0.0                            # 12-factor env-var configuration loader
+starlette>=0.37.0,<1.0.0                                   # FastAPI substrate (pinned for deterministic resolution)
+uvicorn[standard]>=0.29.0,<1.0.0                           # ASGI server (Dockerfile CMD); [standard] -> uvloop + httptools
+
+
+# -----------------------------------------------------------------------------
+# Kafka — Event Streaming Backbone
+# -----------------------------------------------------------------------------
+# confluent-kafka wraps librdkafka for high-throughput produce; the
+# [avro,schemaregistry,json] extras stream events through Schema Registry
+# per AAP R-14. fastavro is the compiled Avro serializer used by the
+# Schema Registry Avro encoder. The Payment Service is a PRODUCER of
+# `payment.succeeded`, `payment.failed`, and `payment.refunded` events
+# (AAP Section 0.4.2 / R-30) and a CONSUMER of `order.*` events for the
+# saga choreography. Failures route to `<topic>.retry` then `<topic>.dlq`
+# per AAP R-17. Sibling services (notification-service,
+# recommendation-engine) use the same client to share operational tooling
+# and monitoring dashboards (AAP Section 0.3.1 — confluent-kafka).
+# -----------------------------------------------------------------------------
+confluent-kafka[avro,schemaregistry,json]>=2.3.0,<3.0.0    # AAP R-14 (Schema Registry) + R-17 (retry/DLQ) + R-30 (event naming)
+fastavro>=1.9.0,<2.0.0                                     # Avro serialization for Schema Registry-encoded events
+
+
+# -----------------------------------------------------------------------------
+# Database — PostgreSQL (payment_db, encrypted at rest — AAP R-8)
+# -----------------------------------------------------------------------------
+# The Payment Service owns its own data store per AAP Rule R-6 (database-
+# per-service). The store is PostgreSQL with five tables — `payments`,
+# `payment_attempts`, `refunds`, `provider_webhooks`, `idempotency_keys`
+# — per AAP Section 0.4.4. Encryption at rest (AAP R-8) is realized via
+# column-level envelope encryption using KMS-issued data keys (see the
+# KMS Clients group below) on top of cluster-level disk encryption.
+# psycopg v3 (NOT psycopg2) provides native asyncio support and a
+# built-in connection pool; SQLAlchemy 2.0 layers async ORM / query-
+# builder semantics on top with the postgresql+psycopg:// dialect URL.
+# alembic runs migrations under `migrations/` on container startup or via
+# a dedicated migration job (AAP R-9).
+# -----------------------------------------------------------------------------
+alembic>=1.13.0,<2.0.0                                     # AAP R-9 — migration runner for the five payment tables
+psycopg[binary,pool]>=3.1.18,<4.0.0                        # PostgreSQL driver v3 (binary wheel + connection pool)
+sqlalchemy>=2.0.25,<3.0.0                                  # AAP Section 0.4.4 — async ORM / query builder over psycopg v3
+
+
+# -----------------------------------------------------------------------------
+# HTTP Client — Outbound to Provider APIs
+# -----------------------------------------------------------------------------
+# httpx is the async-first HTTP client used directly for Razorpay REST
+# calls (the official Razorpay SDK is sync-only) and as the underlying
+# transport for any custom Stripe REST calls outside the official SDK.
+# It supports per-request timeouts, transport-level retries (combined
+# with `tenacity` below), HTTP/2, and cleanly integrates with respx for
+# tests. Outbound calls to Stripe, Razorpay, and any signed-webhook
+# verification endpoints are wrapped by the resilience decorators per
+# AAP R-15 / R-16.
+# -----------------------------------------------------------------------------
+httpx>=0.27.0,<1.0.0                                       # AAP Section 0.4.2 — async HTTP client w/ HTTP/2 + timeouts
+
+
+# -----------------------------------------------------------------------------
+# Payment Provider SDKs (AAP R-10 — dual-provider concurrent integration)
+# -----------------------------------------------------------------------------
+# Per AAP R-10 the Payment Service MUST integrate Stripe AND Razorpay
+# concurrently behind a unified `PaymentProvider` interface; provider
+# selection is data-driven at runtime via currency, region, or merchant
+# preference (env vars STRIPE_ENABLED / RAZORPAY_ENABLED gate provider
+# initialization without rebuilding the image). BOTH SDKs ship in every
+# image so operators can flip providers or enable Stripe→Razorpay
+# fallback (and vice versa) instantly. This is non-negotiable: dropping
+# either SDK violates AAP R-10.
+#
+# Stripe SDK upper bound `<13.0.0` is intentionally wide because the
+# Stripe SDK has had several major-version releases in a short window
+# (v8 → v9 → v10 → v11 → v12); the API version pin is enforced at
+# runtime via the STRIPE_API_VERSION env var, NOT via an SDK pin.
+# Razorpay's official Python SDK is published under the `razorpay`
+# distribution name (1.4.x line); the SDK is sync-only and is wrapped
+# with `run_in_executor` for async use OR replaced by direct httpx REST
+# calls in src/providers/razorpay/.
+# -----------------------------------------------------------------------------
+razorpay>=1.4.2,<2.0.0                                     # AAP R-10 — RazorpayProvider adapter (India-focused; sync SDK)
+stripe>=9.0.0,<13.0.0                                      # AAP R-10 — StripeProvider adapter (global; multi-major upper bound documented)
+
+
+# -----------------------------------------------------------------------------
+# Resilience — Retry, Backoff, Circuit Breaker
+# -----------------------------------------------------------------------------
+# tenacity provides retry decorators with exponential backoff + jitter,
+# bounded attempts, and configurable predicates per AAP R-15. Retries
+# protect every Stripe / Razorpay HTTP call and every Kafka produce
+# attempt. pybreaker wraps each outbound provider call site with a
+# thread-safe in-process circuit breaker (open / half-open / closed) per
+# AAP R-16; on Stripe circuit-open the routing strategy can fall back to
+# Razorpay (and vice versa) when both providers are eligible for the
+# given currency/region. Both libraries are explicitly listed as
+# canonical examples in AAP Section 0.3.1 alongside resilience4j and
+# opossum, and they match the resilience stack used by sibling services
+# (notification-service, recommendation-engine) for operational
+# consistency.
+# -----------------------------------------------------------------------------
+pybreaker>=1.2.0,<2.0.0                                    # AAP R-16 — circuit breaker (open / half-open / closed states)
+tenacity>=8.2.3,<9.0.0                                     # AAP R-15 — retry w/ exponential backoff + jitter, bounded attempts
+
+
+# -----------------------------------------------------------------------------
+# Authentication — JWT Validation Only
+# -----------------------------------------------------------------------------
+# Per AAP R-21, the Auth Service is the SOLE issuer of JWT tokens; this
+# service VALIDATES ONLY, never signs. pyjwt[crypto] supports RS256/ES256
+# verification using public keys fetched from the Auth Service JWKS
+# endpoint. cachetools provides the bounded-TTL JWKS key cache mandated
+# by AAP R-22 — keys are refreshed automatically without restart, which
+# enables seamless key rotation in the Auth Service.
+# -----------------------------------------------------------------------------
+cachetools>=5.3.0,<6.0.0                                   # AAP R-22 — bounded TTL cache for JWKS keys
+pyjwt[crypto]>=2.8.0,<3.0.0                                # AAP R-21 / R-22 — JWT validation only (RS256/ES256)
+
+
+# -----------------------------------------------------------------------------
+# Cryptography — Webhook Signature Verification + Envelope Encryption
+# -----------------------------------------------------------------------------
+# `cryptography` is transitively installed by `pyjwt[crypto]`; pinning it
+# explicitly here makes CVE-driven version bumps auditable in this single
+# manifest rather than buried in transitive resolution. The Payment
+# Service uses `cryptography` directly for two distinct concerns:
+#
+#   1. HMAC-SHA256 webhook signature verification (AAP R-12). Stripe
+#      sends a `Stripe-Signature` header; Razorpay sends a
+#      `X-Razorpay-Signature` header. Verification MUST run on the raw
+#      request body BEFORE any JSON parsing to prevent canonicalization
+#      drift. Python's stdlib `hmac` + `hashlib` cover the SHA-256
+#      primitive; `cryptography` is retained for asymmetric primitives
+#      (RSA / EC) used by some webhook providers and for Fernet symmetric
+#      keys.
+#
+#   2. Envelope-encryption helpers for column-level encryption (AAP R-8).
+#      Sensitive columns (PII, last4 not derivable, idempotency
+#      payloads) are encrypted with Fernet using a per-row data encryption
+#      key (DEK) wrapped by a KMS-issued key encryption key (KEK). See
+#      src/security/envelope.py for the canonical wiring.
+# -----------------------------------------------------------------------------
+cryptography>=42.0.0,<43.0.0                               # AAP R-12 (HMAC webhook signature verification) + R-8 (envelope encryption)
+
+
+# -----------------------------------------------------------------------------
+# KMS Clients — Encryption-at-Rest Key Management (AAP R-8)
+# -----------------------------------------------------------------------------
+# AAP R-8 mandates that the Payment Service database is encrypted at
+# rest. Encryption is realized via envelope encryption (see the
+# Cryptography group above): per-row data encryption keys (DEKs) are
+# generated and wrapped by a KMS-issued key encryption key (KEK). The
+# KMS backend is selected at runtime via the ENCRYPTION_PROVIDER env
+# var; we ship clients for AWS KMS (boto3) and HashiCorp Vault Transit
+# (hvac) out-of-the-box. Other KMS providers (GCP KMS, Azure Key Vault)
+# are pluggable via a deployment-specific requirements-extra.txt.
+#
+# botocore is pinned explicitly because boto3 and botocore must come
+# from the same minor series; over-constraining one without the other
+# would break installation.
+# -----------------------------------------------------------------------------
+boto3>=1.34.0,<2.0.0                                       # AAP R-8 — AWS KMS data-key generation (ENCRYPTION_PROVIDER=aws_kms)
+botocore>=1.34.0,<2.0.0                                    # boto3 transitive dependency pinned for deterministic resolution
+hvac>=2.1.0,<3.0.0                                         # AAP R-8 / R-25 — HashiCorp Vault Transit (ENCRYPTION_PROVIDER=vault)
+
+
+# -----------------------------------------------------------------------------
+# Observability — Logs, Metrics, Tracing
+# -----------------------------------------------------------------------------
+# All logs are emitted as structured JSON with the canonical fields per
+# AAP R-26 (timestamp, level, service, correlation_id, user_id, route,
+# method, status, latency_ms, message). Filebeat tails container stdout
+# and ships to Logstash per AAP R-27. Prometheus metrics surface at
+# /metrics for Metricbeat scraping. OpenTelemetry primitives propagate
+# the X-Correlation-ID through HTTP and Kafka headers and through
+# SQLAlchemy spans for end-to-end tracing of the
+# charge → reserve → persist → emit flow. Per AAP R-13 the correlation
+# ID is also propagated to Stripe and Razorpay where each provider
+# supports a custom request header (idempotency-key + metadata fields).
+# -----------------------------------------------------------------------------
+opentelemetry-api>=1.24.0,<2.0.0                           # OTel tracing API — correlation-ID propagation primitives
+opentelemetry-exporter-otlp>=1.24.0,<2.0.0                 # OTLP exporter for traces / metrics
+opentelemetry-instrumentation-fastapi>=0.45b0,<1.0.0       # Auto-instrument FastAPI request lifecycle (charge / refund / webhook endpoints)
+opentelemetry-instrumentation-httpx>=0.45b0,<1.0.0         # Auto-instrument outbound httpx calls (Razorpay REST + custom Stripe REST)
+opentelemetry-instrumentation-sqlalchemy>=0.45b0,<1.0.0    # Auto-instrument SQLAlchemy queries (payments / refunds / idempotency_keys)
+opentelemetry-sdk>=1.24.0,<2.0.0                           # OTel SDK — span processors, exporters
+prometheus-client>=0.20.0,<1.0.0                           # AAP R-27 — /metrics endpoint scraped by Metricbeat
+python-json-logger>=2.0.7,<3.0.0                           # JSON formatter for stdlib logging compatibility
+structlog>=24.1.0,<25.0.0                                  # AAP R-26 — structured JSON log emission
+
+
+# -----------------------------------------------------------------------------
+# General Utilities
+# -----------------------------------------------------------------------------
+# orjson backs FastAPI's ORJSONResponse for fast response serialization.
+# python-dotenv loads `.env` files in local development only — production
+# Kubernetes injects secrets via Secret resources (AAP R-25). pyyaml parses
+# `config/default.yaml`. python-dateutil handles timezone- and locale-
+# aware logic in the webhook signature replay-tolerance windows (Stripe's
+# `tolerance` parameter and Razorpay's timestamp validation use absolute
+# UTC offsets from the request `Date` / signature header).
+# -----------------------------------------------------------------------------
+orjson>=3.9.15,<4.0.0                                      # Fast JSON serialization (FastAPI ORJSONResponse)
+python-dateutil>=2.9.0,<3.0.0                              # Timezone / locale handling for webhook timestamp tolerance windows
+python-dotenv>=1.0.0,<2.0.0                                # Local-dev .env loader (NOT used in production per AAP R-25)
+pyyaml>=6.0.1,<7.0.0                                       # config/default.yaml parsing
+
+
+# =============================================================================
+# Testing (dev)
+# =============================================================================
+# These dependencies support the pytest-driven unit and integration suites
+# under `services/payment-service/tests/`. They are bundled into the main
+# manifest for monorepo simplicity matching sibling services
+# (notification-service, recommendation-engine); a future split into
+# `requirements-dev.txt` is permissible but not required.
+#
+# testcontainers spins up real Kafka and Postgres containers for
+# integration tests so producer / persistence behavior is exercised
+# against the genuine wire protocol. respx mocks httpx calls (Stripe /
+# Razorpay HTTP stubs); moto[kms] mocks AWS KMS data-key generation
+# without real AWS credentials, keeping CI fast and deterministic.
+# freezegun enables deterministic time mocking for retry-backoff,
+# idempotency-key TTL, and webhook timestamp-tolerance tests. faker /
+# factory-boy generate realistic fixture data (orders, payments,
+# refunds, webhook payloads) for the unit suite.
+# =============================================================================
+factory-boy>=3.3.0,<4.0.0                                  # dev — fixture builder for payment / refund / webhook test entities
+faker>=24.0.0,<25.0.0                                      # dev — fixture data generators (orders, payments, customers)
+freezegun>=1.4.0,<2.0.0                                    # dev — time mocking for retry backoff, idempotency TTL, webhook tolerance windows
+moto[kms]>=5.0.0,<6.0.0                                    # dev — AWS KMS mocking for encryption-at-rest unit tests (no real AWS creds)
+pytest>=8.0.0,<9.0.0                                       # dev — primary test runner
+pytest-asyncio>=0.23.0,<1.0.0                              # dev — async test support
+pytest-cov>=4.1.0,<5.0.0                                   # dev — coverage reporting
+respx>=0.21.0,<1.0.0                                       # dev — httpx request mocking (Stripe / Razorpay HTTP stubs)
+testcontainers[kafka,postgres]>=4.0.0,<5.0.0               # dev — real Kafka / Postgres containers for integration tests
+
+
+# =============================================================================
+# OPERATOR NOTES
+# -----------------------------------------------------------------------------
+# 1. Install:
+#       python -m pip install -r requirements.txt
+#
+# 2. Reproducible builds (optional):
+#       pip-compile requirements.in -o requirements.lock
+#    Lockfile generation is recommended for production builds but not
+#    required by this project.
+#
+# 3. Provider selection at runtime (AAP R-10):
+#    Even when only one provider is active per deployment (e.g., a
+#    US-only deployment uses Stripe; an India-only deployment uses
+#    Razorpay), BOTH provider SDKs are installed so operators can flip
+#    providers via the STRIPE_ENABLED / RAZORPAY_ENABLED environment
+#    variables without rebuilding the container image. This realizes
+#    the "concurrent dual-provider integration" requirement of AAP R-10
+#    and the Stripe ↔ Razorpay fallback path of AAP Section 0.4.2.
+#
+# 4. Encryption-at-rest backend (AAP R-8):
+#    The KMS backend is selected at runtime via the ENCRYPTION_PROVIDER
+#    environment variable. boto3 is included for AWS KMS, hvac for
+#    HashiCorp Vault Transit. Add cloud-specific KMS clients
+#    (google-cloud-kms, azure-keyvault-keys) to a deployment-specific
+#    requirements-extra.txt if needed; do NOT add them to this manifest
+#    unless they become a baseline requirement.
+#
+# 5. Container build dependencies (Dockerfile builder stage):
+#    System packages required to compile the wheels above:
+#       libpq-dev          (psycopg)
+#       librdkafka-dev     (confluent-kafka)
+#       libssl-dev         (cryptography)
+#       libffi-dev         (cryptography / cffi)
+#       build-essential    (general C/C++ toolchain)
+#    Runtime stage installs only the shared-library counterparts:
+#       libpq5
+#       librdkafka1
+#       libssl3
+#
+# 6. Schema Registry compatibility:
+#    confluent-kafka[schemaregistry] transitively pulls `requests`. Do
+#    not duplicate-pin requests in this manifest.
+#
+# 7. psycopg v3 vs v2:
+#    This manifest installs psycopg v3 (`import psycopg`). Code MUST NOT
+#    use `import psycopg2`. SQLAlchemy 2.0 async wires through the
+#    `postgresql+psycopg://` dialect URL — see
+#    src/repository/payment_repository.py for the canonical wiring.
+#
+# 8. JWT validation only (AAP R-21):
+#    This service holds NO signing keys. pyjwt is used solely to verify
+#    RS256 / ES256 signatures against the Auth Service's public JWKS
+#    keyset. Any code path that attempts to call `jwt.encode()` with an
+#    asymmetric private key violates the architectural contract and
+#    must be rejected in code review.
+#
+# 9. SECURITY NOTICE — Payment Data Handling:
+#    This service handles payment data and is in PCI-DSS scope. Operators
+#    and contributors MUST observe the following invariants when
+#    extending this manifest:
+#
+#      a. NEVER add a package that logs full request/response bodies by
+#         default (e.g., debugging middlewares with body capture).
+#      b. NEVER add a package that persists arbitrary data outside
+#         payment_db (no extra storage backends without architectural
+#         review).
+#      c. NEVER add a debug middleware or profiler that exposes secrets
+#         in logs, response headers, or stack traces.
+#      d. Stripe and Razorpay API keys, JWT signing keys, KMS key IDs,
+#         and webhook signing secrets MUST come from Kubernetes Secrets
+#         or a secret manager — NEVER from `.env` files in production
+#         (AAP R-25).
+#      e. CVE-driven version bumps to `cryptography`, `pyjwt`, `stripe`,
+#         `razorpay`, `boto3`, and `hvac` MUST be expedited;
+#         `pip-audit -r requirements.txt` is part of the CI pipeline.
+# =============================================================================
+
