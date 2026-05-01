@@ -1,0 +1,408 @@
+# =============================================================================
+# Order Service — Python Dependencies
+# =============================================================================
+# Target runtime  : Python 3.11+
+# Service domain  : Order lifecycle orchestration + Saga Coordinator for the
+#                   e-commerce checkout flow. Implements the
+#                   create -> reserve-inventory -> take-payment -> confirm |
+#                   compensate state machine, persists durable saga state to
+#                   PostgreSQL, produces order.created / order.cancelled /
+#                   order.fulfilled events to Kafka, and consumes
+#                   inventory.* and payment.* events for choreographed
+#                   compensation. Per AAP Section 0.5.2.2 bullet 6 and
+#                   AAP R-18 (saga pattern with explicit compensation steps).
+# Source of truth : Agent Action Plan (AAP) Section 0.3.1 (public packages),
+#                   Section 0.3.3 (dependency updates), Section 0.4.2
+#                   (Kafka producer/consumer + saga choreography), Section
+#                   0.4.4 (order_db PostgreSQL schema with the four tables:
+#                   orders, order_items, order_status_history, saga_state),
+#                   and applicable rules R-6 (database-per-service), R-9
+#                   (alembic migrations), R-13 (correlation-ID propagation
+#                   to all downstream calls), R-14 (Schema Registry), R-15
+#                   (retry with exponential backoff + jitter), R-16
+#                   (circuit breaker), R-17 (DLQ / retry topics), R-18
+#                   (saga pattern with compensation), R-19 (liveness /
+#                   readiness probes), R-21 / R-22 (JWT validation with
+#                   bounded TTL JWKS cache), R-26 / R-27 (structured JSON
+#                   logs shipped via Beats to Logstash), R-30 (event
+#                   naming conventions: <domain>.<verb>).
+#
+# Pinning policy  : Every package carries a lower bound (>=) and an upper
+#                   bound (<) excluding the next major version. This permits
+#                   safe patch / minor upgrades while preventing breaking
+#                   major-version drift. No package is left bare; no `==`
+#                   pinning is used unless accompanied by a "# pin: <reason>"
+#                   comment.
+#
+# Ordering        : Grouped by concern, alphabetized within each group for
+#                   deterministic diffs. Runtime dependencies appear first;
+#                   testing (dev) dependencies are gathered at the bottom
+#                   under the "Testing (dev)" banner. Group ordering mirrors
+#                   sibling Python services (payment-service,
+#                   notification-service, recommendation-engine) for
+#                   monorepo cognitive consistency and grep-ability.
+#
+# Subtractive    : The Order Service deliberately omits provider SDKs that
+# scope          live in sibling services. Per AAP architectural rules:
+#                   - NO stripe / razorpay  -> payment-service domain
+#                   - NO twilio / sendgrid / boto3 SES|SNS -> notification-service
+#                   - NO redis / pgvector / scikit-learn / numpy / scipy
+#                     / tensorflow / torch -> recommendation-engine
+#                   - NO jinja2 / babel / markupsafe -> notification-service
+#                     template engine
+#                   The saga-specific behaviors (compensation orchestration,
+#                   step timeouts, deadlock detection) are realized in
+#                   `src/saga/` using the resilience primitives (`tenacity`
+#                   + `pybreaker`) and the native asyncio scheduler — no
+#                   additional saga framework is required.
+#
+# Install         : python -m pip install -r requirements.txt
+# Compile wheels  : pip wheel -r requirements.txt -w /tmp/wheels
+# Audit CVEs      : pip-audit -r requirements.txt
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Web Framework & ASGI Server
+# -----------------------------------------------------------------------------
+# FastAPI exposes the synchronous order-management endpoints — POST /orders
+# (place an order, kicks off the saga), GET /orders/{id} (fetch order +
+# saga status), GET /orders/{id}/status-history, POST /orders/{id}/cancel,
+# GET /health/live, GET /health/ready, GET /metrics — fronted by the API
+# Gateway per AAP Section 0.5.1 (Mermaid edge: `Gateway -->|REST /orders|
+# OrderSvc`). FastAPI auto-generates the OpenAPI document referenced by
+# the Gateway and `docs/api/*` per AAP Section 0.3.1 (OpenAPI tooling).
+# uvicorn[standard] adds uvloop + httptools for production throughput;
+# the Dockerfile CMD runs `uvicorn ... --loop uvloop --http httptools`.
+# Pydantic v2 powers request/response validation AND validates the Kafka
+# event payloads emitted by the saga coordinator (order.created,
+# order.cancelled, order.fulfilled). pydantic-settings drives 12-factor
+# environment-variable configuration loading and fails fast on missing
+# required variables per AAP R-19.
+# -----------------------------------------------------------------------------
+fastapi>=0.110.0,<1.0.0                                    # AAP Section 0.3.1 — OpenAPI tooling / sync HTTP entrypoints
+pydantic>=2.6.0,<3.0.0                                     # Request / response model validation (FastAPI v2 stack) + Kafka event payloads
+pydantic-settings>=2.2.0,<3.0.0                            # 12-factor env-var configuration loader (R-19 fail-fast on startup)
+starlette>=0.37.0,<1.0.0                                   # FastAPI substrate (pinned for deterministic resolution)
+uvicorn[standard]>=0.29.0,<1.0.0                           # ASGI server (Dockerfile CMD); [standard] -> uvloop + httptools
+
+
+# -----------------------------------------------------------------------------
+# Kafka — Saga Event Backbone (AAP R-14, R-17, R-18, R-30)
+# -----------------------------------------------------------------------------
+# confluent-kafka wraps librdkafka for high-throughput produce + consume;
+# the [avro,schemaregistry,json] extras stream events through Schema
+# Registry per AAP R-14 to enforce backward-compatible schema evolution.
+# fastavro is the compiled Avro serializer used by the Schema Registry
+# Avro encoder.
+#
+# The Order Service plays a DUAL role on the Kafka bus per AAP Section
+# 0.4.2 (saga choreography):
+#
+#   PRODUCER of the order.* domain topics (AAP R-30 — <domain>.<verb>):
+#     * order.created    -> downstream: payment-service, inventory-service,
+#                                       notification-service, recommendation-engine
+#     * order.cancelled  -> downstream: payment-service (refund), inventory-service
+#                                       (release), notification-service
+#     * order.fulfilled  -> downstream: notification-service (confirmation),
+#                                       recommendation-engine (signal feedback)
+#
+#   CONSUMER of the inventory.* and payment.* domain topics for saga
+#   choreography (AAP R-18 — explicit compensation steps):
+#     * inventory.reserved      -> advance saga state PENDING -> RESERVED
+#     * inventory.released      -> compensation acknowledgement
+#     * inventory.low-stock     -> opportunistic notification (no saga gate)
+#     * payment.succeeded       -> advance saga state RESERVED -> PAID
+#     * payment.failed          -> trigger inventory release compensation
+#     * payment.refunded        -> finalize cancellation
+#
+# Failures route to `<topic>.retry` then `<topic>.dlq` per AAP R-17. The
+# producer is configured with `enable.idempotence=true` and `acks=all` for
+# saga event durability; the consumer uses MANUAL offset commits
+# (`enable.auto.commit=false`) so an offset is committed ONLY AFTER the
+# corresponding saga state mutation has been durably written to Postgres
+# (AAP R-18 — durable saga state). Sibling services (payment-service,
+# notification-service, recommendation-engine) use the same client to
+# share operational tooling and monitoring dashboards.
+# -----------------------------------------------------------------------------
+confluent-kafka[avro,schemaregistry,json]>=2.3.0,<3.0.0    # AAP R-14 (Schema Registry) + R-17 (retry/DLQ) + R-30 (event naming)
+fastavro>=1.9.0,<2.0.0                                     # Avro serialization for Schema Registry-encoded events
+
+
+# -----------------------------------------------------------------------------
+# Database — PostgreSQL (order_db)
+# -----------------------------------------------------------------------------
+# The Order Service owns its own data store per AAP Rule R-6 (database-
+# per-service). The store is PostgreSQL with four tables — `orders`,
+# `order_items`, `order_status_history`, `saga_state` — per AAP Section
+# 0.4.4. The `saga_state` table is the durable backbone of AAP R-18:
+# every saga step transition (CREATE -> RESERVING -> PAYING -> CONFIRMED |
+# COMPENSATING -> CANCELLED) is committed in the same transaction as the
+# Kafka offset commit, guaranteeing exactly-once-effect semantics across
+# crashes and rebalances.
+#
+# psycopg v3 (NOT psycopg2) provides native asyncio support and a
+# built-in connection pool that is sized via env vars (DB_POOL_MIN /
+# DB_POOL_MAX) per service. SQLAlchemy 2.0 layers async ORM / query-
+# builder semantics on top via the `postgresql+psycopg://` dialect URL —
+# see src/repository/order_repository.py and src/repository/saga_repository.py
+# for the canonical wiring. alembic runs the DDL migrations under
+# `services/order-service/migrations/versions/` on container startup or
+# via a dedicated migration job per AAP R-9.
+# -----------------------------------------------------------------------------
+alembic>=1.13.0,<2.0.0                                     # AAP R-9 — migration runner for the four order_db tables
+psycopg[binary,pool]>=3.1.18,<4.0.0                        # PostgreSQL driver v3 (binary wheel + connection pool)
+sqlalchemy>=2.0.25,<3.0.0                                  # AAP Section 0.4.4 — async ORM / query builder over psycopg v3
+
+
+# -----------------------------------------------------------------------------
+# HTTP Client — Outbound (JWKS + Read-Side Lookups)
+# -----------------------------------------------------------------------------
+# httpx is the async-first HTTP client used by the Order Service for two
+# narrow purposes:
+#
+#   1. JWKS public-key fetch from the Auth Service (AAP R-22 — bounded
+#      TTL JWKS cache). The fetch is wrapped in `tenacity` retry +
+#      `pybreaker` circuit-breaker decorators with cached fall-back.
+#
+#   2. Occasional read-side metadata lookups (e.g., resolving a product
+#      SKU to its current price during order placement when the cached
+#      price is stale). All such lookups are wrapped in resilience
+#      primitives and fall back gracefully on circuit-open per AAP R-15
+#      / R-16 / R-20.
+#
+# The Order Service does NOT call payment providers directly — payment-
+# service owns that boundary per AAP architectural separation. Cross-
+# service HTTP calls are deliberately minimized in favor of asynchronous
+# Kafka choreography to preserve service autonomy (AAP R-32).
+# -----------------------------------------------------------------------------
+httpx>=0.27.0,<1.0.0                                       # AAP Section 0.4.2 — async HTTP client w/ HTTP/2 + timeouts
+
+
+# -----------------------------------------------------------------------------
+# Resilience — Retry, Backoff, Circuit Breaker (AAP R-15, R-16)
+# -----------------------------------------------------------------------------
+# tenacity provides retry decorators with exponential backoff + jitter,
+# bounded attempts, and configurable predicates per AAP R-15. Retries
+# protect every Kafka produce attempt, every JWKS fetch, every read-side
+# HTTP call, and every saga step's downstream message dispatch.
+# pybreaker wraps each outbound call site with a thread-safe in-process
+# circuit breaker (open / half-open / closed) per AAP R-16; the open-
+# state of any critical breaker (Kafka, JWKS) is reflected on
+# `/health/ready` per AAP R-19 — the readiness probe fails closed until
+# the breaker enters half-open / closed.
+#
+# These primitives also implement saga step-level resilience (AAP R-18):
+# each saga step (reserve-inventory, take-payment) carries its own
+# tenacity policy with a step-specific `SAGA_STEP_TIMEOUT_MS` ceiling.
+# Both libraries are explicitly listed as canonical examples in AAP
+# Section 0.3.1 alongside resilience4j and opossum, and they match the
+# resilience stack used by sibling services for operational consistency.
+# -----------------------------------------------------------------------------
+pybreaker>=1.2.0,<2.0.0                                    # AAP R-16 — circuit breaker (open / half-open / closed states)
+tenacity>=8.2.3,<9.0.0                                     # AAP R-15 — retry w/ exponential backoff + jitter, bounded attempts
+
+
+# -----------------------------------------------------------------------------
+# Authentication — JWT Validation Only
+# -----------------------------------------------------------------------------
+# Per AAP R-21, the Auth Service is the SOLE issuer of JWT tokens; this
+# service VALIDATES ONLY, never signs. pyjwt[crypto] supports RS256/ES256
+# verification using public keys fetched from the Auth Service JWKS
+# endpoint. cachetools provides the bounded-TTL JWKS key cache mandated
+# by AAP R-22 — keys are refreshed automatically without restart, which
+# enables seamless key rotation in the Auth Service. The middleware in
+# src/middleware/auth.py rejects requests whose JWT signature, expiry
+# (`exp`), or required-scope claims fail validation; rejected requests
+# are answered with HTTP 401 and emit a structured-log audit line per
+# AAP R-26.
+# -----------------------------------------------------------------------------
+cachetools>=5.3.0,<6.0.0                                   # AAP R-22 — bounded TTL cache for JWKS keys
+pyjwt[crypto]>=2.8.0,<3.0.0                                # AAP R-21 / R-22 — JWT validation only (RS256/ES256)
+
+
+# -----------------------------------------------------------------------------
+# Observability — Logs, Metrics, Tracing (AAP R-26, R-27, R-28)
+# -----------------------------------------------------------------------------
+# All logs are emitted as structured JSON with the canonical fields per
+# AAP R-26 (timestamp, level, service, correlation_id, user_id, route,
+# method, status, latency_ms, message) plus saga-specific fields
+# (saga_id, order_id, saga_step, saga_state). Filebeat tails container
+# stdout and ships to Logstash per AAP R-27. Prometheus metrics surface
+# at /metrics for Metricbeat scraping; the Order Service exports the
+# saga-specific metrics referenced in AAP R-28:
+#
+#   * orders_placed_total{status}                 (counter)
+#   * saga_state_transitions_total{from,to}       (counter)
+#   * saga_compensation_total{reason}             (counter)
+#   * saga_manual_intervention_total{reason}      (counter)
+#   * saga_in_flight                              (gauge)
+#   * saga_step_latency_ms{step}                  (histogram)
+#   * kafka_consumer_lag{topic,partition}         (gauge)
+#   * dlq_depth{topic}                            (gauge)
+#
+# OpenTelemetry primitives propagate the X-Correlation-ID through HTTP
+# (auto-instrumented FastAPI + httpx) and SQLAlchemy spans (auto-
+# instrumented) for end-to-end tracing of the
+# place -> reserve -> charge -> confirm | compensate flow. The
+# correlation ID is also injected into outbound Kafka message headers so
+# downstream services can stitch the trace continuously per AAP R-13.
+# -----------------------------------------------------------------------------
+opentelemetry-api>=1.24.0,<2.0.0                           # OTel tracing API — correlation-ID propagation primitives
+opentelemetry-exporter-otlp>=1.24.0,<2.0.0                 # OTLP exporter for traces / metrics
+opentelemetry-instrumentation-fastapi>=0.45b0,<1.0.0       # Auto-instrument FastAPI request lifecycle (POST /orders, GET /orders/{id}, etc.)
+opentelemetry-instrumentation-httpx>=0.45b0,<1.0.0         # Auto-instrument outbound httpx calls (JWKS + read-side lookups)
+opentelemetry-instrumentation-sqlalchemy>=0.45b0,<1.0.0    # Auto-instrument SQLAlchemy queries (orders / saga_state writes)
+opentelemetry-sdk>=1.24.0,<2.0.0                           # OTel SDK — span processors, exporters
+prometheus-client>=0.20.0,<1.0.0                           # AAP R-27 / R-28 — /metrics endpoint scraped by Metricbeat
+python-json-logger>=2.0.7,<3.0.0                           # JSON formatter for stdlib logging compatibility
+structlog>=24.1.0,<25.0.0                                  # AAP R-26 — structured JSON log emission with saga-specific fields
+
+
+# -----------------------------------------------------------------------------
+# Security — Cryptography (CVE patch cadence)
+# -----------------------------------------------------------------------------
+# `cryptography` is transitively installed by `pyjwt[crypto]`; pinning it
+# explicitly here makes CVE-driven version bumps auditable in this single
+# manifest rather than buried in transitive resolution. The Order Service
+# uses `cryptography` directly for HMAC-SHA256 hashing of idempotency
+# keys (POST /orders Idempotency-Key header) so the hash, not the raw
+# key, is persisted in the saga_state row — this protects against
+# accidental log leakage of caller-supplied idempotency tokens. Matches
+# the pin used by sibling services for monorepo consistency.
+# -----------------------------------------------------------------------------
+cryptography>=42.0.0,<43.0.0                               # HMAC-SHA256 idempotency-key hashing + pinned for explicit CVE patch cadence
+
+
+# -----------------------------------------------------------------------------
+# General Utilities
+# -----------------------------------------------------------------------------
+# orjson backs FastAPI's ORJSONResponse for fast response serialization
+# AND is used to serialize Kafka event payloads (orjson.dumps emits
+# canonical JSON that round-trips through Schema Registry's JSON Schema
+# encoder identically across producers and consumers). python-dotenv
+# loads `.env` files in local development only — production Kubernetes
+# injects secrets via Secret resources (AAP R-25). pyyaml parses
+# `config/default.yaml`. python-dateutil handles ISO-8601 parsing for
+# saga deadline tracking (`saga_state.deadline_at`,
+# `SAGA_STEP_TIMEOUT_MS`, `SAGA_COMPENSATION_TIMEOUT_MS`) where naive
+# datetime arithmetic is insufficient.
+# -----------------------------------------------------------------------------
+orjson>=3.9.15,<4.0.0                                      # Fast JSON serialization (FastAPI ORJSONResponse + Kafka event payloads)
+python-dateutil>=2.9.0,<3.0.0                              # ISO-8601 parsing for saga deadlines + timezone-aware arithmetic
+python-dotenv>=1.0.0,<2.0.0                                # Local-dev .env loader (NOT used in production per AAP R-25)
+pyyaml>=6.0.1,<7.0.0                                       # config/default.yaml parsing
+
+
+# =============================================================================
+# Testing (dev)
+# =============================================================================
+# These dependencies support the pytest-driven unit and integration suites
+# under `services/order-service/tests/`. They are bundled into the main
+# manifest for monorepo simplicity matching sibling services
+# (payment-service, notification-service, recommendation-engine); a
+# future split into `requirements-dev.txt` is permissible but not
+# required.
+#
+# testcontainers spins up real Kafka and Postgres containers for
+# integration tests so saga-coordinator behavior is exercised against the
+# genuine wire protocol — this is critical for the Order Service because
+# the saga path cannot be meaningfully unit-tested with mocks alone:
+# integration tests must exercise real Kafka offset commits AND real
+# Postgres `saga_state` durability across simulated crashes (AAP Section
+# 0.5.2.6 — Tests group). respx mocks outbound httpx calls (JWKS fetch,
+# read-side lookups) so unit-level tests can run without a live Auth
+# Service. faker generates realistic order / order-item fixtures.
+# freezegun enables deterministic testing of `SAGA_STEP_TIMEOUT_MS` and
+# `SAGA_COMPENSATION_TIMEOUT_MS` semantics by advancing the clock past
+# the deadline — without freezegun, timeout tests would be flaky and
+# slow.
+# =============================================================================
+faker>=24.0.0,<25.0.0                                      # dev — fixture data generators (orders, order-items, addresses)
+freezegun>=1.4.0,<2.0.0                                    # dev — time mocking for SAGA_STEP_TIMEOUT_MS / compensation deadline tests
+pytest>=8.0.0,<9.0.0                                       # dev — primary test runner
+pytest-asyncio>=0.23.0,<1.0.0                              # dev — async test support
+pytest-cov>=4.1.0,<5.0.0                                   # dev — coverage reporting
+respx>=0.21.0,<1.0.0                                       # dev — httpx request mocking (JWKS + read-side lookup stubs)
+testcontainers[kafka,postgres]>=4.0.0,<5.0.0               # dev — real Kafka / Postgres containers for saga integration tests
+
+
+# =============================================================================
+# OPERATOR NOTES
+# -----------------------------------------------------------------------------
+# 1. Install:
+#       python -m pip install -r requirements.txt
+#
+# 2. Reproducible builds (optional):
+#       pip-compile requirements.in -o requirements.lock
+#    Lockfile generation is recommended for production builds but not
+#    required by this project. Per AAP Section 0.3.1 implementation note,
+#    the downstream build pipeline MUST resolve specific patch versions
+#    at build time and pin them in a generated `requirements-lock.txt`
+#    for production builds. This file (`requirements.txt`) sets the
+#    SUPPORTED RANGE; the lock file pins the EXACT version.
+#
+# 3. Container build dependencies (Dockerfile builder stage):
+#    System packages required to compile the wheels above:
+#       libpq-dev          (psycopg)
+#       librdkafka-dev     (confluent-kafka)
+#       libssl-dev         (cryptography)
+#       libffi-dev         (cryptography / cffi)
+#       build-essential    (general C/C++ toolchain)
+#       python3-dev        (CPython headers)
+#    Runtime stage installs only the shared-library counterparts:
+#       libpq5
+#       librdkafka1
+#       libssl3
+#
+# 4. Schema Registry compatibility:
+#    confluent-kafka[schemaregistry] transitively pulls `requests`. Do
+#    not duplicate-pin `requests` in this manifest.
+#
+# 5. psycopg v3 vs v2:
+#    This manifest installs psycopg v3 (`import psycopg`). Code MUST NOT
+#    use `import psycopg2`. SQLAlchemy 2.0 async wires through the
+#    `postgresql+psycopg://` dialect URL — see
+#    src/repository/order_repository.py and src/repository/saga_repository.py
+#    for the canonical wiring.
+#
+# 6. JWT validation only (AAP R-21):
+#    This service holds NO signing keys. pyjwt is used solely to verify
+#    RS256 / ES256 signatures against the Auth Service's public JWKS
+#    keyset. Any code path that attempts to call `jwt.encode()` with an
+#    asymmetric private key violates the architectural contract and
+#    must be rejected in code review.
+#
+# 7. Kafka consumer offset semantics (AAP R-18 — durable saga state):
+#    KAFKA_ENABLE_AUTO_COMMIT=false is the production default. The
+#    application MUST call `consumer.commit()` MANUALLY after the saga
+#    state mutation triggered by the consumed message has been durably
+#    written to Postgres in the same logical transaction. Without manual
+#    commit, a crash between consumption and persistence would lose the
+#    saga state transition and break exactly-once-effect semantics. See
+#    src/messaging/saga_consumer.py for the canonical wiring.
+#
+# 8. Saga step / compensation timeouts:
+#    SAGA_STEP_TIMEOUT_MS bounds each individual saga step
+#    (reserve-inventory, take-payment); on expiry the saga transitions
+#    to COMPENSATING. SAGA_COMPENSATION_TIMEOUT_MS bounds the entire
+#    compensation phase; on expiry the saga is moved to a manual-
+#    intervention queue with `saga_manual_intervention_total{reason="
+#    compensation_timeout"}` incremented. Both timeouts are deterministically
+#    testable via freezegun in the test suite.
+#
+# 9. Subtractive scope — packages explicitly excluded:
+#    The following packages live in sibling services and MUST NOT appear
+#    in this manifest:
+#       stripe / razorpay         -> services/payment-service/
+#       twilio / sendgrid         -> services/notification-service/
+#       boto3 / botocore (SES/SNS) -> services/notification-service/
+#       jinja2 / babel / markupsafe -> services/notification-service/
+#       redis / hiredis           -> services/recommendation-engine/
+#       pgvector                  -> services/recommendation-engine/
+#       scikit-learn / numpy / scipy / joblib -> services/recommendation-engine/
+#       tensorflow / torch        -> services/recommendation-engine/
+#    Adding any of the above broadens the Order Service's responsibility
+#    surface in violation of AAP R-30 (events are owned by the producing
+#    domain) and AAP architectural separation between services.
+# =============================================================================
