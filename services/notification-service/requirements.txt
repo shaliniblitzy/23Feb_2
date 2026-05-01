@@ -1,0 +1,301 @@
+# =============================================================================
+# Notification Service — Python Dependencies
+# =============================================================================
+# Target runtime  : Python 3.11+
+# Service domain  : Multi-channel transactional notification dispatcher
+#                   (Email + SMS) consuming domain events from Kafka and
+#                   fanning out to provider APIs.
+# Source of truth : Agent Action Plan (AAP) Section 0.3.1 (public packages),
+#                   Section 0.3.3 (dependency updates), Section 0.4.2
+#                   (Email + SMS provider integrations + retries + DLQ),
+#                   Section 0.4.4 (notification_db PostgreSQL schema), and
+#                   applicable rules R-11 (dual-channel concurrent provider
+#                   integration), R-14 (Schema Registry), R-15 (retry with
+#                   exponential backoff + jitter), R-16 (circuit breaker),
+#                   R-17 (DLQ / retry topics), R-21 / R-22 (JWT validation
+#                   with bounded TTL JWKS cache), R-26 / R-27 (structured
+#                   JSON logs shipped via Beats to Logstash), R-30 (event
+#                   naming conventions).
+#
+# Pinning policy  : Every package carries a lower bound (>=) and an upper
+#                   bound (<) excluding the next major version. This permits
+#                   safe patch / minor upgrades while preventing breaking
+#                   major-version drift. No package is left bare; no `==`
+#                   pinning is used unless accompanied by a "# pin: <reason>"
+#                   comment.
+#
+# Ordering        : Grouped by concern, alphabetized within each group for
+#                   deterministic diffs. Runtime dependencies appear first;
+#                   testing (dev) dependencies are gathered at the bottom
+#                   under the "Testing (dev)" banner.
+#
+# Install         : python -m pip install -r requirements.txt
+# Compile wheels  : pip wheel -r requirements.txt -w /tmp/wheels
+# Audit CVEs      : pip-audit -r requirements.txt
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Web Framework & ASGI Server
+# -----------------------------------------------------------------------------
+# FastAPI exposes the synchronous admin/management endpoints — `/health/live`,
+# `/health/ready`, `/metrics`, and any operator REST surface (template CRUD,
+# delivery-log lookup) — and auto-generates the OpenAPI document referenced
+# by the API Gateway and `docs/api/*` per AAP Section 0.3.1 (OpenAPI
+# tooling). uvicorn[standard] adds uvloop + httptools for production
+# throughput. Pydantic v2 powers request/response validation; pydantic-
+# settings drives 12-factor environment-variable configuration loading.
+# -----------------------------------------------------------------------------
+fastapi>=0.110.0,<1.0.0                                    # AAP Section 0.3.1 — OpenAPI tooling / sync HTTP entrypoints
+pydantic>=2.6.0,<3.0.0                                     # Request / response model validation (FastAPI v2 stack)
+pydantic-settings>=2.2.0,<3.0.0                            # 12-factor env-var configuration loader
+starlette>=0.37.0,<1.0.0                                   # FastAPI substrate (pinned for deterministic resolution)
+uvicorn[standard]>=0.29.0,<1.0.0                           # ASGI server (Dockerfile CMD); [standard] -> uvloop + httptools
+
+
+# -----------------------------------------------------------------------------
+# Kafka — Event Streaming Backbone
+# -----------------------------------------------------------------------------
+# confluent-kafka wraps librdkafka for high-throughput consume; the
+# [avro,schemaregistry,json] extras stream events through Schema Registry
+# per AAP R-14. fastavro is the compiled Avro serializer used by the
+# Schema Registry Avro encoder. The Notification Service is a CONSUMER of
+# `order.*`, `payment.*`, and `user.registered` events (AAP Section 0.4.2 /
+# R-30) and routes failures to `<topic>.retry` then `<topic>.dlq` per
+# AAP R-17. Sibling services (recommendation-engine) use the same client
+# to share operational tooling and monitoring dashboards.
+# -----------------------------------------------------------------------------
+confluent-kafka[avro,schemaregistry,json]>=2.3.0,<3.0.0    # AAP R-14 (Schema Registry) + R-17 (retry/DLQ) + R-30 (event naming)
+fastavro>=1.9.0,<2.0.0                                     # Avro serialization for Schema Registry-encoded events
+
+
+# -----------------------------------------------------------------------------
+# Database — PostgreSQL (notification_db)
+# -----------------------------------------------------------------------------
+# The Notification Service owns its own data store per AAP Rule R-6
+# (database-per-service). The store is PostgreSQL with four tables —
+# `notification_log`, `delivery_attempts`, `templates`, `user_channel_prefs`
+# — per AAP Section 0.4.4. psycopg v3 (NOT psycopg2) provides native asyncio
+# support and a built-in connection pool; SQLAlchemy 2.0 layers async ORM
+# / query-builder semantics on top. alembic runs migrations under
+# `migrations/` on container startup or via a dedicated migration job.
+# -----------------------------------------------------------------------------
+alembic>=1.13.0,<2.0.0                                     # AAP Section 0.4.4 — migration runner for the four notification tables
+psycopg[binary,pool]>=3.1.18,<4.0.0                        # PostgreSQL driver v3 (binary wheel + connection pool)
+sqlalchemy>=2.0.25,<3.0.0                                  # AAP Section 0.4.4 — async ORM / query builder over psycopg v3
+
+
+# -----------------------------------------------------------------------------
+# HTTP Client — Outbound to Provider APIs
+# -----------------------------------------------------------------------------
+# httpx is the async-first HTTP client used by EmailChannel (SendGrid
+# REST mode) and SmsChannel (Twilio REST mode). It supports per-request
+# timeouts, transport-level retries (combined with `tenacity` below),
+# HTTP/2, and cleanly integrates with respx for tests. Outbound calls to
+# both Stripe-equivalent provider APIs are wrapped by the resilience
+# decorators per AAP R-15 / R-16.
+# -----------------------------------------------------------------------------
+httpx>=0.27.0,<1.0.0                                       # AAP Section 0.4.2 — async HTTP client w/ HTTP/2 + timeouts
+
+
+# -----------------------------------------------------------------------------
+# Email Providers (AAP R-11 — dual-provider concurrent integration)
+# -----------------------------------------------------------------------------
+# Per AAP R-11 the EmailChannel must support multiple providers concurrently
+# behind a single `NotificationChannel` interface; provider selection is
+# data-driven at runtime via the EMAIL_PROVIDER environment variable. We
+# install BOTH SendGrid and AWS SES SDKs so operators can flip providers
+# without rebuilding the container image. boto3 conveniently serves both
+# AWS SES (email) and AWS SNS (SMS) — it appears once in this manifest and
+# is referenced from the SMS group below. botocore is pinned explicitly
+# because boto3 and botocore must come from the same minor series; over-
+# constraining one without the other would break installation.
+# -----------------------------------------------------------------------------
+boto3>=1.34.0,<2.0.0                                       # AAP R-11 — AWS SES (email) + AWS SNS (SMS) adapters share this SDK
+botocore>=1.34.0,<2.0.0                                    # boto3 transitive dependency pinned for deterministic resolution
+sendgrid>=6.11.0,<7.0.0                                    # AAP R-11 — EmailChannel adapter (official SendGrid SDK)
+
+
+# -----------------------------------------------------------------------------
+# SMS Providers (AAP R-11 — dual-provider concurrent integration)
+# -----------------------------------------------------------------------------
+# Per AAP R-11 the SmsChannel must support multiple providers concurrently
+# behind the `NotificationChannel` interface; provider selection is data-
+# driven at runtime via the SMS_PROVIDER environment variable. We install
+# BOTH the Twilio SDK and (transitively, via boto3 above) the AWS SNS SDK.
+# Twilio's sync client is wrapped with run_in_executor for async use, or
+# operators may switch to a thin httpx-driven adapter — both modes are
+# supported by the codebase under src/channels/sms/.
+# -----------------------------------------------------------------------------
+twilio>=9.0.0,<10.0.0                                      # AAP R-11 — SmsChannel adapter (official Twilio SDK)
+# AWS SNS (SMS) is covered by `boto3` declared in the Email Providers group above.
+
+
+# -----------------------------------------------------------------------------
+# Template Engine — Email Subject/Body and SMS Body Rendering
+# -----------------------------------------------------------------------------
+# Jinja2 renders per-locale email subjects, email bodies (HTML + plain),
+# and SMS bodies sourced from the `templates` table (AAP Section 0.4.4).
+# Strict-undefined mode is enabled in src/templates/engine.py so missing
+# placeholders fail loudly instead of silently shipping a malformed
+# notification. markupsafe is pinned explicitly to ensure CVE-driven
+# patches surface in this manifest rather than being buried in transitive
+# resolution.
+# -----------------------------------------------------------------------------
+jinja2>=3.1.3,<4.0.0                                       # Template engine (folder spec) — strict-undefined mode for safety
+markupsafe>=2.1.5,<3.0.0                                   # Jinja2 transitive dependency pinned for explicit CVE cadence
+
+
+# -----------------------------------------------------------------------------
+# Resilience — Retry, Backoff, Circuit Breaker
+# -----------------------------------------------------------------------------
+# tenacity provides retry decorators with exponential backoff + jitter,
+# bounded attempts, and configurable predicates per AAP R-15. pybreaker
+# wraps each outbound provider call site with a thread-safe in-process
+# circuit breaker (open / half-open / closed) per AAP R-16. Both libraries
+# are explicitly listed as canonical examples in AAP Section 0.3.1
+# alongside resilience4j and opossum, and they match the resilience stack
+# used by sibling `recommendation-engine` for operational consistency.
+# -----------------------------------------------------------------------------
+pybreaker>=1.2.0,<2.0.0                                    # AAP R-16 — circuit breaker (open / half-open / closed states)
+tenacity>=8.2.3,<9.0.0                                     # AAP R-15 — retry w/ exponential backoff + jitter, bounded attempts
+
+
+# -----------------------------------------------------------------------------
+# Authentication — JWT Validation Only
+# -----------------------------------------------------------------------------
+# Per AAP R-21, the Auth Service is the SOLE issuer of JWT tokens; this
+# service VALIDATES ONLY, never signs. pyjwt[crypto] supports RS256/ES256
+# verification using public keys fetched from the Auth Service JWKS
+# endpoint. cachetools provides the bounded-TTL JWKS key cache mandated
+# by AAP R-22 — keys are refreshed automatically without restart, which
+# enables seamless key rotation in the Auth Service.
+# -----------------------------------------------------------------------------
+cachetools>=5.3.0,<6.0.0                                   # AAP R-22 — bounded TTL cache for JWKS keys
+pyjwt[crypto]>=2.8.0,<3.0.0                                # AAP R-21 / R-22 — JWT validation only (RS256/ES256)
+
+
+# -----------------------------------------------------------------------------
+# Observability — Logs, Metrics, Tracing
+# -----------------------------------------------------------------------------
+# All logs are emitted as structured JSON with the canonical fields per
+# AAP R-26 (timestamp, level, service, correlation_id, user_id, route,
+# method, status, latency_ms, message). Filebeat tails container stdout
+# and ships to Logstash per AAP R-27. Prometheus metrics surface at
+# /metrics for Metricbeat scraping. OpenTelemetry primitives propagate
+# the X-Correlation-ID through HTTP and Kafka headers and through
+# SQLAlchemy spans for end-to-end tracing of the consume → render → send
+# → persist flow.
+# -----------------------------------------------------------------------------
+opentelemetry-api>=1.24.0,<2.0.0                           # OTel tracing API — correlation-ID propagation primitives
+opentelemetry-exporter-otlp>=1.24.0,<2.0.0                 # OTLP exporter for traces / metrics
+opentelemetry-instrumentation-fastapi>=0.45b0,<1.0.0       # Auto-instrument FastAPI request lifecycle (admin endpoints)
+opentelemetry-instrumentation-httpx>=0.45b0,<1.0.0         # Auto-instrument outbound httpx calls (SendGrid / Twilio REST)
+opentelemetry-instrumentation-sqlalchemy>=0.45b0,<1.0.0    # Auto-instrument SQLAlchemy queries (notification_log writes)
+opentelemetry-sdk>=1.24.0,<2.0.0                           # OTel SDK — span processors, exporters
+prometheus-client>=0.20.0,<1.0.0                           # AAP R-27 — /metrics endpoint scraped by Metricbeat
+python-json-logger>=2.0.7,<3.0.0                           # JSON formatter for stdlib logging compatibility
+structlog>=24.1.0,<25.0.0                                  # AAP R-26 — structured JSON log emission
+
+
+# -----------------------------------------------------------------------------
+# Security — Cryptography (CVE patch cadence)
+# -----------------------------------------------------------------------------
+# `cryptography` is transitively installed by `pyjwt[crypto]`; pinning it
+# explicitly here makes CVE-driven version bumps auditable in this single
+# manifest rather than buried in transitive resolution. Matches the pin
+# used by sibling `recommendation-engine` for monorepo consistency.
+# -----------------------------------------------------------------------------
+cryptography>=42.0.0,<43.0.0                               # Pinned for explicit CVE patch cadence (also pulled via pyjwt[crypto])
+
+
+# -----------------------------------------------------------------------------
+# General Utilities
+# -----------------------------------------------------------------------------
+# orjson backs FastAPI's ORJSONResponse for fast response serialization.
+# python-dotenv loads `.env` files in local development only — production
+# Kubernetes injects secrets via Secret resources (AAP R-25). pyyaml parses
+# `config/default.yaml`. python-dateutil + babel handle locale- and
+# timezone-aware logic in the channel-routing layer (quiet-hours
+# suppression and per-locale template selection).
+# -----------------------------------------------------------------------------
+babel>=2.14.0,<3.0.0                                       # Locale handling for per-locale subject/body rendering
+orjson>=3.9.15,<4.0.0                                      # Fast JSON serialization (FastAPI ORJSONResponse)
+python-dateutil>=2.9.0,<3.0.0                              # Timezone / locale handling for quiet-hours channel routing
+python-dotenv>=1.0.0,<2.0.0                                # Local-dev .env loader (NOT used in production per AAP R-25)
+pyyaml>=6.0.1,<7.0.0                                       # config/default.yaml parsing
+
+
+# =============================================================================
+# Testing (dev)
+# =============================================================================
+# These dependencies support the pytest-driven unit and integration suites
+# under `services/notification-service/tests/`. They are bundled into the
+# main manifest for monorepo simplicity matching sibling services; a
+# future split into `requirements-dev.txt` is permissible but not
+# required. testcontainers spins up real Kafka and Postgres containers
+# for integration tests so consumer / persistence behavior is exercised
+# against the genuine wire protocol. respx mocks httpx calls (SendGrid /
+# Twilio stubs); moto mocks AWS service calls (SES / SNS) without
+# requiring real AWS credentials, keeping CI fast and deterministic.
+# freezegun enables deterministic time mocking for retry-backoff and
+# quiet-hours tests; faker generates realistic fixture data.
+# =============================================================================
+faker>=24.0.0,<25.0.0                                      # dev — fixture data generators (user profiles, event payloads)
+freezegun>=1.4.0,<2.0.0                                    # dev — time mocking for retry backoff + quiet-hours tests
+moto[ses,sns]>=5.0.0,<6.0.0                                # dev — AWS SES + SNS mocking without real AWS credentials
+pytest>=8.0.0,<9.0.0                                       # dev — primary test runner
+pytest-asyncio>=0.23.0,<1.0.0                              # dev — async test support
+pytest-cov>=4.1.0,<5.0.0                                   # dev — coverage reporting
+respx>=0.21.0,<1.0.0                                       # dev — httpx request mocking (SendGrid / Twilio REST stubs)
+testcontainers[kafka,postgres]>=4.0.0,<5.0.0               # dev — real Kafka / Postgres containers for integration tests
+
+
+# =============================================================================
+# OPERATOR NOTES
+# -----------------------------------------------------------------------------
+# 1. Install:
+#       python -m pip install -r requirements.txt
+#
+# 2. Reproducible builds (optional):
+#       pip-compile requirements.in -o requirements.lock
+#    Lockfile generation is recommended for production builds but not
+#    required by this project.
+#
+# 3. Provider selection at runtime (AAP R-11):
+#    Even when only one provider is active per deployment, BOTH SendGrid
+#    and AWS SES SDKs are installed for email, and BOTH Twilio and AWS
+#    SNS SDKs are installed for SMS, so operators can flip providers via
+#    the EMAIL_PROVIDER and SMS_PROVIDER environment variables without
+#    rebuilding the container image. This realizes the "concurrent dual-
+#    provider integration" requirement of AAP R-11.
+#
+# 4. Container build dependencies (Dockerfile builder stage):
+#    System packages required to compile the wheels above:
+#       libpq-dev          (psycopg)
+#       librdkafka-dev     (confluent-kafka)
+#       libssl-dev         (cryptography)
+#       libffi-dev         (cryptography / cffi)
+#       build-essential    (general C/C++ toolchain)
+#    Runtime stage installs only the shared-library counterparts:
+#       libpq5
+#       librdkafka1
+#       libssl3
+#
+# 5. Schema Registry compatibility:
+#    confluent-kafka[schemaregistry] transitively pulls `requests`. Do not
+#    duplicate-pin requests in this manifest.
+#
+# 6. psycopg v3 vs v2:
+#    This manifest installs psycopg v3 (`import psycopg`). Code MUST NOT
+#    use `import psycopg2`. SQLAlchemy 2.0 async wires through the
+#    `postgresql+psycopg://` dialect URL — see
+#    src/repository/notification_repository.py for the canonical wiring.
+#
+# 7. JWT validation only (AAP R-21):
+#    This service holds NO signing keys. pyjwt is used solely to verify
+#    RS256/ES256 signatures against the Auth Service's public JWKS keyset.
+#    Any code path that attempts to call jwt.encode() with an asymmetric
+#    private key violates the architectural contract and must be rejected
+#    in code review.
+# =============================================================================
