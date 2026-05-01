@@ -1,0 +1,367 @@
+# =============================================================================
+# Payment Service — Default Configuration (Base Layer)
+# =============================================================================
+# Loaded FIRST by pydantic-settings at service startup (see ../src/config/
+# settings.py). Environment-specific overrides and environment variables take
+# higher precedence.
+#
+# Loading precedence (lowest → highest):
+#   1. default.yaml           (this file — base layer)
+#   2. <ENVIRONMENT>.yaml     (if present, e.g., local.yaml for ENVIRONMENT=local)
+#   3. environment variables  (highest — see ../.env.example)
+#
+# SECURITY (AAP R-25): This file contains NO secrets. Stripe / Razorpay API
+# keys, webhook secrets, DB credentials, KMS key references, and any URL
+# bearing credentials are supplied via environment variables at runtime
+# (sourced from Kubernetes Secrets / Vault / cloud secret manager). The
+# authoritative env-var catalog lives in ../.env.example.
+#
+# PCI-DSS POSTURE: Payment Service NEVER stores raw PANs, full CVV, or full
+# card-holder names. Only provider-issued tokens (charge_id, payment_method_id)
+# and PCI-allowed display elements (last4, brand) are persisted, AND those
+# are pgcrypto-encrypted at the column level via the keys listed under
+# `encryption.encrypted_columns` (AAP R-8).
+#
+# CROSS-FILE COUPLING:
+#   * Topic names in `kafka.consumer.topics` MUST match event names in
+#     ../../../docs/architecture/event-catalog.md and AAP Section 0.4.2.
+#   * `service.port` (8000) MUST match the EXPOSE directive in ../Dockerfile
+#     and SERVICE_PORT in ../.env.example.
+#   * DLQ / retry topic suffixes MUST match AAP R-17 (`.dlq`, `.retry`).
+#   * `auth.audience` MUST match `service.name` ("payment-service") and the
+#     JWT_AUDIENCE env var in ../.env.example.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 1. service — process identity, listen port, environment classifier
+# -----------------------------------------------------------------------------
+service:
+  name: payment-service                    # logical service name; emitted in every log line (AAP R-26 "service" field)
+  version: 1.0.0                           # bump on every backward-incompatible change
+  port: 8000                               # HTTP listen port; MUST match Dockerfile EXPOSE and .env.example SERVICE_PORT
+  environment: local                       # overridden by ENVIRONMENT env var; values: local | dev | stage | prod
+
+
+# -----------------------------------------------------------------------------
+# 2. logging — structured JSON log shape (AAP R-26) + PCI hygiene
+# -----------------------------------------------------------------------------
+# All emitted records are JSON with the AAP R-26 required fields. Two
+# Payment-Service-specific safeguards are enabled by default:
+#   * `redact_provider_bodies` — full Stripe/Razorpay request and response
+#     bodies are scrubbed before they ever reach a log line (AAP R-12 +
+#     PCI hygiene). Only redacted summaries (status, latency, charge_id)
+#     survive into the structured logs.
+#   * `pan_redaction_enabled` — a regex-based filter scrubs any PAN-like
+#     digit sequence (13–19 digits passing Luhn) as a defense-in-depth
+#     measure even when upstream bodies look "safe".
+logging:
+  level: INFO                              # overridden by LOG_LEVEL env var; values: DEBUG | INFO | WARN | ERROR
+  format: json                             # MUST remain "json" (AAP R-26 — structured JSON logs)
+  include_correlation_id: true             # AAP Section 0.4.5 — correlation-ID middleware appends this field on every log line
+  redact_provider_bodies: true             # AAP R-12 + PCI hygiene — full Stripe/Razorpay request/response bodies NEVER logged
+  pan_redaction_enabled: true              # PCI hygiene — log filter scrubs PAN-like digit patterns before emit
+
+
+# -----------------------------------------------------------------------------
+# 3. postgres — `payment_db` (encrypted at rest) — AAP Section 0.4.4 + R-8
+# -----------------------------------------------------------------------------
+# The Payment Service owns its private `payment_db` PostgreSQL instance per
+# AAP R-6 (database-per-service). Schema includes the five tables from
+# AAP Section 0.4.4: `payments`, `payment_attempts`, `refunds`,
+# `provider_webhooks`, and `idempotency_keys`. The database is encrypted
+# at rest (AAP R-8) — column-level pgcrypto on top of volume-level
+# encryption (see the `encryption` section below). The connection URL
+# itself (POSTGRES_URL) is supplied via env var so credentials never
+# appear here.
+postgres:
+  # POSTGRES_URL is supplied via env var (AAP R-25 — no URL with credentials in this file)
+  pool_min_size: 2                         # minimum idle connections
+  pool_max_size: 20                        # maximum concurrent connections per instance (write-mid workload)
+  statement_timeout_ms: 5000               # enforced server-side via SET statement_timeout
+  connect_timeout_seconds: 5               # give up on a dead host quickly (AAP R-19 fail-fast)
+  require_tls: true                        # MUST be true in non-local environments (AAP R-24)
+  # POSTGRES_TLS_ROOT_CERT_PATH (optional CA bundle) supplied via env var
+
+
+# -----------------------------------------------------------------------------
+# 4. kafka — async event consumption + production (AAP R-14, R-17, R-30)
+# -----------------------------------------------------------------------------
+# The `consumer.topics` list is AUTHORITATIVE — it MUST contain exactly the
+# 2 trigger topics from AAP Section 0.4.2. The `producer.topics` list MUST
+# contain exactly the 3 outcome topics. The DLQ topic list MUST include
+# `payment.dlq` (poison messages) plus per-consumed-topic DLQs. All inbound
+# payloads are validated against Schema Registry per AAP R-14, and all
+# produced events are versioned per AAP R-31.
+#
+# `enable_auto_commit: false` is deliberate. The consumer commits offsets
+# only AFTER the successful provider call AND DB write, delivering at-least-
+# once semantics; combined with idempotency keys (AAP R-8) this gives
+# deterministic exactly-once-effectively semantics.
+kafka:
+  # KAFKA_BOOTSTRAP + SCHEMA_REGISTRY_URL supplied via env vars (AAP R-25)
+  group_id: payment-service                # Consumer group ID
+  auto_offset_reset: earliest              # start from oldest offset for new consumer groups
+  enable_auto_commit: false                # manual commit after successful processing (at-least-once semantics)
+  max_poll_records: 50                     # batch size per poll
+  session_timeout_ms: 30000                # Kafka consumer session timeout
+  heartbeat_interval_ms: 10000             # ~1/3 of session_timeout per Kafka docs
+  producer_acks: all                       # AAP R-14 — strongest durability for payment events
+  producer_enable_idempotence: true        # avoid duplicate event publication on producer retry
+  retry_topic_suffix: .retry               # AAP R-17 — retry topic naming convention
+  dlq_topic_suffix: .dlq                   # AAP R-17 — dead-letter topic naming convention
+  consumer_retry:                          # AAP R-17 — bounded retries before DLQ routing
+    max_attempts: 3
+    backoff_ms: 500                        # initial backoff; multiplier fixed at 2.0 in application code
+  consumer:
+    topics:                                # AAP Section 0.4.2 + 0.5.2.2 bullet 7 — events consumed
+      - order.created                      # capture trigger
+      - order.cancelled                    # refund trigger
+  producer:
+    topics:                                # AAP Section 0.4.2 + 0.5.2.2 bullet 7 — events produced
+      - payment.succeeded
+      - payment.failed
+      - payment.refunded
+  dlq:
+    topics:                                # AAP Section 0.4.2 — DLQs this service writes to
+      - payment.dlq                        # poison messages, signature failures, unknown event types
+      - order.created.dlq                  # exhausted retries on consumed event
+      - order.cancelled.dlq                # exhausted retries on consumed event
+  schema_registry:
+    subjects:                              # AAP R-14 — event-name → Schema Registry subject map
+      payment.succeeded: payment.succeeded-value
+      payment.failed: payment.failed-value
+      payment.refunded: payment.refunded-value
+      order.created: order.created-value
+      order.cancelled: order.cancelled-value
+
+
+# -----------------------------------------------------------------------------
+# 5. providers — Stripe + Razorpay dual-provider concurrent integration
+# -----------------------------------------------------------------------------
+# AAP R-10 (CRITICAL): Both providers are first-class peers wired
+# concurrently behind the unified `PaymentProvider` interface. Selection
+# at request time is DATA-DRIVEN by `routing.rules` (currency / region)
+# with optional per-merchant override; NEVER hard-coded in code.
+#
+# Both providers share an IDENTICAL retry / circuit-breaker shape so
+# operators tune them symmetrically. Retry presets satisfy AAP R-15
+# (exponential backoff + jitter, bounded attempts). Circuit-breaker
+# presets satisfy AAP R-16 (failure-rate threshold, call-volume
+# threshold, open duration, half-open probe). Routing fallback on
+# circuit-open satisfies AAP R-20 (Stripe ↔ Razorpay failover).
+providers:
+  stripe:                                  # Stripe — global markets, 135+ currencies (AAP R-10)
+    enabled: true                          # set false to disable Stripe routing on this deployment
+    # STRIPE_API_KEY + STRIPE_WEBHOOK_SECRET supplied via env (AAP R-25)
+    base_url: https://api.stripe.com
+    api_version: "2024-04-10"              # pinned API version; quoted to prevent YAML date parsing
+    connect_timeout_ms: 2000
+    read_timeout_ms: 10000
+    retry:                                 # AAP R-15 — exponential backoff + jitter, bounded attempts
+      max_attempts: 5
+      initial_delay_ms: 200
+      multiplier: 2.0
+      max_delay_ms: 10000
+      jitter_pct: 0.2
+    circuit_breaker:                       # AAP R-16
+      failure_rate_threshold_pct: 50
+      call_volume_threshold: 20
+      open_duration_ms: 30000
+      half_open_permitted_calls: 1
+  razorpay:                                # Razorpay — India: UPI, net banking, wallets (AAP R-10)
+    enabled: true                          # set false to disable Razorpay routing on this deployment
+    # RAZORPAY_KEY_ID + RAZORPAY_KEY_SECRET + RAZORPAY_WEBHOOK_SECRET supplied via env (AAP R-25)
+    base_url: https://api.razorpay.com/v1
+    connect_timeout_ms: 2000
+    read_timeout_ms: 10000
+    retry:                                 # AAP R-15 — same shape as Stripe for operator parity
+      max_attempts: 5
+      initial_delay_ms: 200
+      multiplier: 2.0
+      max_delay_ms: 10000
+      jitter_pct: 0.2
+    circuit_breaker:                       # AAP R-16 — same shape as Stripe for operator parity
+      failure_rate_threshold_pct: 50
+      call_volume_threshold: 20
+      open_duration_ms: 30000
+      half_open_permitted_calls: 1
+  routing:                                 # AAP R-10 — data-driven, NOT hard-coded
+    default_provider: stripe               # global default when no rule matches
+    fallback_on_open_circuit: true         # AAP R-20 — auto-fallback to alternate provider when primary CB is open
+    respect_merchant_override: true        # allow per-merchant pinning to override currency defaults
+    rules:                                 # currency-keyed routing table (ISO-4217)
+      INR:
+        primary: razorpay                  # India default — UPI / net banking / wallets
+        fallback: stripe                   # international card support fallback
+      USD:
+        primary: stripe                    # global default for USD
+        fallback: ""                       # empty = no fallback for USD by default; merchant-config can override
+      EUR:
+        primary: stripe
+        fallback: ""
+      GBP:
+        primary: stripe
+        fallback: ""
+
+
+# -----------------------------------------------------------------------------
+# 6. idempotency — replay safety for charge / refund (AAP R-8)
+# -----------------------------------------------------------------------------
+# Every charge / refund call is idempotent so safe retries (after network
+# blips, ambiguous timeouts, or operator-driven replays) do not double-
+# charge customers. The Payment Service:
+#   1. Accepts an inbound `Idempotency-Key` header from the API Gateway.
+#   2. Persists the key + sha256(request body) in `payment_db.idempotency_keys`.
+#   3. Forwards a derived idempotency key (with `outbound_key_prefix`) to
+#      the upstream provider so the provider also rejects duplicates.
+# 72-hour TTL matches Stripe's documented idempotency-key retention.
+idempotency:
+  header_name: Idempotency-Key             # inbound API header name (RFC draft convention)
+  ttl_hours: 72                            # how long to remember a key — allows safe replays for ~3 days
+  request_hash_algo: sha256                # algorithm used to fingerprint request bodies for replay-mismatch detection
+  outbound_key_prefix: psvc-               # prefix for keys sent to providers (helps trace in provider dashboards)
+
+
+# -----------------------------------------------------------------------------
+# 7. webhooks — inbound provider callbacks (AAP R-12)
+# -----------------------------------------------------------------------------
+# Webhook receivers authenticate inbound provider callbacks via HMAC
+# signatures (AAP R-12), NOT via JWT — see `auth.public_routes` below
+# for the deliberate carve-out from the JWT validation middleware. The
+# 300-second tolerance matches Stripe's documented signature-tolerance
+# default and is also Razorpay-compatible. `fail_fast_on_bad_signature`
+# is `true` so attackers cannot fill the DLQ with garbage events.
+webhooks:
+  tolerance_seconds: 300                   # AAP R-12 — replay-protection window: max allowed clock skew (5 min)
+  max_body_bytes: 262144                   # reject webhooks > 256 KB to prevent abuse / amplification
+  fail_fast_on_bad_signature: true         # drop on signature mismatch (200 OK to provider, no DLQ); never quarantine
+  endpoints:                               # webhook receiver paths (informational; routes wired in src/api/webhooks/)
+    stripe: /webhooks/stripe
+    razorpay: /webhooks/razorpay
+
+
+# -----------------------------------------------------------------------------
+# 8. encryption — column-level pgcrypto (AAP R-8) — UNIQUE TO PAYMENT SERVICE
+# -----------------------------------------------------------------------------
+# AAP R-8 mandates encryption at rest for the Payment Service database.
+# The fields enumerated in `encrypted_columns` receive pgcrypto column-
+# level encryption on top of volume-level encryption — defense in depth
+# against database backup compromise. The KMS / Vault backend is selected
+# at runtime via the ENCRYPTION_PROVIDER env var (local | aws_kms |
+# gcp_kms | vault); no default is set here so operators MUST choose
+# explicitly per environment. Envelope encryption: a long-lived KMS-
+# protected key encrypts short-lived data keys cached in-process for
+# `data_key_cache_ttl_seconds` to amortize KMS API calls.
+encryption:
+  # ENCRYPTION_PROVIDER selects the key-management backend at runtime via env var.
+  # Valid values: local | aws_kms | gcp_kms | vault
+  # Default unset here so operators MUST choose explicitly per environment.
+  data_key_cache_ttl_seconds: 300          # TTL for cached envelope-encryption data keys
+  encrypted_columns:                       # AAP R-8 — pgcrypto column-level encryption applied to these columns
+    - last4
+    - brand
+    - holder_name
+    - provider_charge_id
+    - provider_refund_id
+
+
+# -----------------------------------------------------------------------------
+# 9. auth — JWT validation only; this service is never an issuer (AAP R-21)
+# -----------------------------------------------------------------------------
+# The Payment Service VALIDATES JWTs minted by the Auth Service. It is
+# NEVER an issuer (AAP R-21). Public keys are fetched from the Auth
+# Service JWKS endpoint and cached with a bounded TTL (AAP R-22) so key
+# rotation propagates without service restart. Per-endpoint scope
+# requirements enforce least-privilege access (AAP R-23 / RFC 6749).
+# Webhook receiver paths are listed in `public_routes` because they
+# authenticate via HMAC signatures rather than JWTs (see `webhooks` above).
+auth:
+  # JWT_PUBLIC_KEY_URL (JWKS endpoint), JWT_ISSUER supplied via env (AAP R-25)
+  jwks_cache_ttl_seconds: 3600             # bounded TTL for JWKS key cache (AAP R-22)
+  audience: payment-service                # expected `aud` JWT claim — MUST match service.name
+  algorithms:                              # accepted JWT signing algorithms (AAP R-23 / RFC 7519)
+    - RS256
+    - ES256
+  clock_skew_seconds: 30                   # tolerate mild clock drift across services
+  required_scopes:                         # per-endpoint OAuth 2.0 scope requirements (AAP R-23)
+    charge: payments:charge                # POST /payments
+    refund: payments:refund                # POST /payments/{id}/refund
+    admin: payments:admin                  # GET /payments/{id}/attempts and other admin endpoints
+  public_routes:                           # routes NOT requiring a JWT
+    - /health/live
+    - /health/ready
+    - /metrics
+    - /webhooks/stripe                     # webhook receivers authenticate via HMAC signature, not JWT
+    - /webhooks/razorpay
+
+
+# -----------------------------------------------------------------------------
+# 10. observability — Prometheus + OpenTelemetry (AAP R-26, R-27)
+# -----------------------------------------------------------------------------
+# Logs and metrics ship via Filebeat / Metricbeat to Logstash and
+# Elasticsearch (AAP R-27). The `/metrics` endpoint exposes Prometheus
+# format on a dedicated port (9090) so application traffic on port
+# `service.port` (8000) is never scraped together with management
+# telemetry. The OTel resource attribute `otel_service_name` matches
+# `service.name` so traces correlate cleanly with structured logs.
+observability:
+  metrics_port: 9090                       # /metrics endpoint port (scraped by Metricbeat per AAP R-27)
+  metrics_path: /metrics
+  otel_service_name: payment-service       # OpenTelemetry resource attribute; matches service.name
+  # OTEL_EXPORTER_OTLP_ENDPOINT supplied via env at runtime (AAP R-25)
+
+
+# -----------------------------------------------------------------------------
+# 11. http — outbound HTTP client defaults (non-provider calls)
+# -----------------------------------------------------------------------------
+# Default values applied to outbound HTTP calls that do not override
+# them. Provider-specific overrides (Stripe / Razorpay) live in their
+# own `providers.<name>` sections above. The User-Agent identifies our
+# traffic to upstream services / providers during incident triage.
+http:
+  user_agent: payment-service/1.0          # User-Agent header on all outbound HTTP calls
+  default_connect_timeout_ms: 2000         # default connect timeout for non-provider HTTP calls
+  default_read_timeout_ms: 10000           # default read timeout for non-provider HTTP calls
+
+
+# -----------------------------------------------------------------------------
+# 12. health — liveness / readiness probes (AAP R-19)
+# -----------------------------------------------------------------------------
+# AAP R-19 mandates liveness and readiness probes. `liveness_path`
+# returns 200 as long as the process is alive; it NEVER blocks on
+# downstream dependencies (otherwise a flaky DB would cause the pod to
+# be restarted unnecessarily). `readiness_path` verifies that all
+# critical dependencies are reachable AND at least one provider is
+# enabled — this gate keeps traffic off cold instances until they can
+# actually fulfill a charge. `startup_grace_seconds` matches the
+# Dockerfile `HEALTHCHECK --start-period=20s`; changing one requires
+# changing the other.
+health:
+  liveness_path: /health/live              # process-alive probe — never blocks on dependencies
+  readiness_path: /health/ready            # all critical deps reachable: Postgres, Kafka, AND active providers
+  startup_grace_seconds: 20                # accommodate Postgres pool + Kafka group join + JWKS fetch + KMS warm-up
+  ready_check_includes:                    # what the readiness probe verifies (AAP R-19 fail-fast)
+    - postgres
+    - kafka
+    - schema_registry
+    - active_providers                     # gated by providers.<name>.enabled
+
+
+# =============================================================================
+# END OF DEFAULT CONFIGURATION
+# -----------------------------------------------------------------------------
+# Next loading step: pydantic-settings applies any <ENVIRONMENT>.yaml overrides,
+# then applies env-var overrides. See ../.env.example for the full env-var
+# catalog and ../README.md for service-level documentation.
+#
+# REMINDERS (Payment Service — strictest security posture):
+#   * Never put real Stripe keys (sk_live_..., sk_test_...) here.
+#   * Never put real Razorpay keys (rzp_live_..., rzp_test_...) here.
+#   * Never put webhook secrets (whsec_...) here.
+#   * Never put POSTGRES_URL with credentials here.
+#   * Never put KMS key ARNs that resolve to live keys here.
+#   * Adapter pattern (PaymentProvider) and routing rules are data-driven; if
+#     you find yourself hard-coding a provider name in code, the rules belong
+#     under `providers.routing.rules` instead (AAP R-10).
+# =============================================================================
