@@ -1,0 +1,249 @@
+# =============================================================================
+# Recommendation Engine — Python Dependencies
+# =============================================================================
+# Target runtime  : Python 3.11+
+# Service domain  : ML-based personalized product recommendation service
+# Source of truth : Agent Action Plan (AAP) Section 0.3.1 (public packages),
+#                   Section 0.3.3 (dependency updates), Section 0.4.2 (Product
+#                   Service HTTP client + fallback), Section 0.4.4 (pgvector +
+#                   Redis), and applicable rules R-14 (Schema Registry),
+#                   R-15 (retry with exponential backoff + jitter), R-16
+#                   (circuit breaker), R-17 (DLQ / retry topics), R-21 / R-22
+#                   (JWT validation + JWKS bounded TTL caching), R-26 / R-27
+#                   (structured JSON logs shipped via Beats to Logstash),
+#                   R-30 (event naming conventions).
+#
+# Pinning policy  : Every package carries a lower bound (>=) and an upper
+#                   bound (<) excluding the next major version. This permits
+#                   safe patch / minor upgrades while preventing breaking
+#                   major-version drift. No package is left bare; no `==`
+#                   pinning is used unless accompanied by a "# pin: <reason>"
+#                   comment.
+#
+# Ordering        : Grouped by concern, alphabetized within each group for
+#                   deterministic diffs. Runtime dependencies appear first;
+#                   testing (dev) dependencies are gathered at the bottom
+#                   under the "Testing (dev)" banner.
+#
+# Install         : python -m pip install -r requirements.txt
+# Compile wheels  : pip wheel -r requirements.txt -w /tmp/wheels
+# Audit CVEs      : pip-audit -r requirements.txt
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Web Framework & ASGI Server
+# -----------------------------------------------------------------------------
+# FastAPI exposes the synchronous read-side endpoints (/recommendations,
+# /health/live, /health/ready) and auto-generates the OpenAPI document
+# referenced by the API Gateway and by docs/api/* per AAP Section 0.3.1
+# (OpenAPI tooling). uvicorn[standard] adds uvloop + httptools for production
+# throughput. Pydantic v2 powers request/response validation and settings
+# loading.
+# -----------------------------------------------------------------------------
+fastapi>=0.110.0,<1.0.0                                    # AAP Section 0.3.1 — OpenAPI tooling / sync HTTP entrypoints
+pydantic>=2.6.0,<3.0.0                                     # Request / response model validation (FastAPI v2 stack)
+pydantic-settings>=2.2.0,<3.0.0                            # 12-factor env-var configuration loader
+starlette>=0.37.0,<1.0.0                                   # FastAPI substrate (pinned for deterministic resolution)
+uvicorn[standard]>=0.29.0,<1.0.0                           # ASGI server (Dockerfile CMD); [standard] -> uvloop + httptools
+
+
+# -----------------------------------------------------------------------------
+# Kafka — Event Streaming Backbone
+# -----------------------------------------------------------------------------
+# confluent-kafka wraps librdkafka for high-throughput produce/consume; the
+# [avro,schemaregistry,json] extras stream events through Schema Registry per
+# AAP R-14. fastavro is the compiled Avro serializer used by the Schema
+# Registry Avro encoder. The Recommendation Engine is a CONSUMER of
+# product.*, order.*, and user.* events (AAP Section 0.4.2 / R-30) and may
+# emit recommendation.refreshed for cache invalidation. Retry/DLQ topic
+# routing required by AAP R-17 is implemented in src/messaging/.
+# -----------------------------------------------------------------------------
+confluent-kafka[avro,schemaregistry,json]>=2.3.0,<3.0.0    # AAP R-14 (Schema Registry) + R-17 (retry/DLQ) + R-30 (event naming)
+fastavro>=1.9.0,<2.0.0                                     # Avro serialization for Schema Registry-encoded events
+
+
+# -----------------------------------------------------------------------------
+# Database — pgvector + PostgreSQL
+# -----------------------------------------------------------------------------
+# The Recommendation Engine owns its own data store per AAP Rule R-6
+# (database-per-service). The store is PostgreSQL with the pgvector extension
+# (AAP Section 0.4.4) backing the `embeddings` table for cosine / L2
+# similarity queries. psycopg v3 is used (NOT psycopg2): native asyncio
+# support and a built-in connection pool make it a clean fit for FastAPI's
+# async stack.
+# -----------------------------------------------------------------------------
+pgvector>=0.2.5,<1.0.0                                     # pgvector adapter for psycopg v3 — vector(n) column type + KNN ops
+psycopg[binary,pool]>=3.1.18,<4.0.0                        # PostgreSQL driver v3 (binary wheel + connection pool)
+
+
+# -----------------------------------------------------------------------------
+# Redis — Recommendation Cache
+# -----------------------------------------------------------------------------
+# Redis fronts the inference path with the `rec_cache` keyspace (AAP Section
+# 0.4.4) to absorb hot-path traffic and feed the popularity-based fallback
+# (AAP Section 0.4.2 — fallback path for the Product Service read). hiredis
+# is the C parser for the wire protocol; it is optional but materially
+# accelerates the redis client and is compiled in the Dockerfile builder
+# stage.
+# -----------------------------------------------------------------------------
+hiredis>=2.3.0,<3.0.0                                      # Native C protocol parser — performance accelerator for redis client
+redis>=5.0.0,<6.0.0                                        # Redis client (uses redis.asyncio for non-blocking I/O)
+
+
+# -----------------------------------------------------------------------------
+# HTTP Client — Outbound to Product Service
+# -----------------------------------------------------------------------------
+# httpx is the async-first HTTP client used to call the Product Service
+# (AAP Section 0.4.2). Cached responses in Redis form the fallback path
+# when Product Service is unreachable — popularity-based recommendations
+# replace personalized output (AAP Section 0.4.2 — "RecoSvc -> ProductSvc:
+# Cached Redis response; degrade to popularity-based recs").
+# -----------------------------------------------------------------------------
+httpx>=0.27.0,<1.0.0                                       # AAP Section 0.4.2 — async HTTP client w/ HTTP/2 + timeouts
+
+
+# -----------------------------------------------------------------------------
+# Resilience — Retry, Backoff, Circuit Breaker
+# -----------------------------------------------------------------------------
+# tenacity provides retry decorators with exponential backoff + jitter,
+# bounded attempts, and configurable predicates per AAP R-15. pybreaker
+# wraps each outbound call site with a thread-safe in-process circuit
+# breaker (open / half-open / closed) per AAP R-16. Both libraries are
+# explicitly listed as examples in AAP Section 0.3.1.
+# -----------------------------------------------------------------------------
+pybreaker>=1.2.0,<2.0.0                                    # AAP R-16 — circuit breaker (open / half-open / closed states)
+tenacity>=8.2.3,<9.0.0                                     # AAP R-15 — retry w/ exponential backoff + jitter, bounded attempts
+
+
+# -----------------------------------------------------------------------------
+# Authentication — JWT Validation Only
+# -----------------------------------------------------------------------------
+# Per AAP R-21, the Auth Service is the SOLE issuer of JWT tokens; this
+# service VALIDATES ONLY, never signs. pyjwt[crypto] supports RS256/ES256
+# verification using public keys fetched from the Auth Service JWKS
+# endpoint. cachetools provides the bounded-TTL JWKS key cache mandated by
+# AAP R-22.
+# -----------------------------------------------------------------------------
+cachetools>=5.3.0,<6.0.0                                   # AAP R-22 — bounded TTL cache for JWKS keys
+pyjwt[crypto]>=2.8.0,<3.0.0                                # AAP R-21 / R-22 — JWT validation only (RS256/ES256)
+
+
+# -----------------------------------------------------------------------------
+# Machine Learning / Inference
+# -----------------------------------------------------------------------------
+# scikit-learn is the default ML runtime for the reference implementation
+# (NearestNeighbors, TF-IDF, matrix factorization helpers) — chosen over
+# tensorflow / torch to keep the default container image small. AAP Section
+# 0.3.1 lists scikit-learn alongside tensorflow-serving and torchserve as
+# acceptable candidates. numpy is pinned to <2.0 because scikit-learn /
+# scipy ABI compatibility matrices for the 1.4–1.7 line are validated
+# against numpy 1.26 (see Phase 5 compatibility notes in agent prompt).
+# joblib serializes trained models to ./models/latest/*.joblib.
+# -----------------------------------------------------------------------------
+joblib>=1.3.0,<2.0.0                                       # Model serialization (joblib.dump / joblib.load)
+numpy>=1.26.0,<2.0.0                                       # Numerical primitives — pinned <2.0 for sklearn / scipy ABI parity
+scikit-learn>=1.4.0,<2.0.0                                 # AAP Section 0.3.1 — default ML serving runtime
+scipy>=1.12.0,<2.0.0                                       # Sparse matrix support for large interaction matrices
+
+
+# -----------------------------------------------------------------------------
+# Observability — Logs, Metrics, Tracing
+# -----------------------------------------------------------------------------
+# All logs are emitted as structured JSON with the canonical fields per
+# AAP R-26 (timestamp, level, service, correlation_id, user_id, route,
+# method, status, latency_ms, message). Filebeat tails container stdout
+# and ships to Logstash per AAP R-27. Prometheus metrics surface at
+# /metrics for Metricbeat scraping. OpenTelemetry primitives propagate
+# the X-Correlation-ID through HTTP and Kafka headers.
+# -----------------------------------------------------------------------------
+opentelemetry-api>=1.24.0,<2.0.0                           # OTel tracing API — correlation-ID propagation primitives
+opentelemetry-exporter-otlp>=1.24.0,<2.0.0                 # OTLP exporter for traces / metrics
+opentelemetry-instrumentation-fastapi>=0.45b0,<1.0.0       # Auto-instrument FastAPI request lifecycle
+opentelemetry-instrumentation-httpx>=0.45b0,<1.0.0         # Auto-instrument outbound httpx calls (Product Service)
+opentelemetry-sdk>=1.24.0,<2.0.0                           # OTel SDK — span processors, exporters
+prometheus-client>=0.20.0,<1.0.0                           # AAP R-27 — /metrics endpoint scraped by Metricbeat
+python-json-logger>=2.0.7,<3.0.0                           # JSON formatter for stdlib logging compatibility
+structlog>=24.1.0,<25.0.0                                  # AAP R-26 — structured JSON log emission
+
+
+# -----------------------------------------------------------------------------
+# Security — Cryptography (CVE patch cadence)
+# -----------------------------------------------------------------------------
+# `cryptography` is transitively installed by `pyjwt[crypto]`; pinning it
+# explicitly here makes CVE-driven version bumps auditable in this single
+# manifest rather than buried in transitive resolution.
+# -----------------------------------------------------------------------------
+cryptography>=42.0.0,<43.0.0                               # Pinned for explicit CVE patch cadence (also pulled via pyjwt[crypto])
+
+
+# -----------------------------------------------------------------------------
+# General Utilities
+# -----------------------------------------------------------------------------
+# orjson backs FastAPI's ORJSONResponse for fast response serialization.
+# python-dotenv loads .env files in local development only; production K8s
+# injects secrets via Secret resources (AAP R-25). pyyaml parses
+# config/default.yaml.
+# -----------------------------------------------------------------------------
+orjson>=3.9.15,<4.0.0                                      # Fast JSON serialization (FastAPI ORJSONResponse)
+python-dotenv>=1.0.0,<2.0.0                                # Local-dev .env loader (NOT used in production per AAP R-25)
+pyyaml>=6.0.1,<7.0.0                                       # config/default.yaml parsing
+
+
+# =============================================================================
+# Testing (dev)
+# =============================================================================
+# These dependencies support the pytest-driven unit and integration suites
+# under services/recommendation-engine/tests/. They are bundled into the
+# main manifest for monorepo simplicity; a future split into
+# requirements-dev.txt is permissible but not required.
+# =============================================================================
+faker>=24.0.0,<25.0.0                                      # dev — fixture data generators
+freezegun>=1.4.0,<2.0.0                                    # dev — time mocking for cache TTL tests
+pytest>=8.0.0,<9.0.0                                       # dev — primary test runner
+pytest-asyncio>=0.23.0,<1.0.0                              # dev — async test support
+pytest-cov>=4.1.0,<5.0.0                                   # dev — coverage reporting
+respx>=0.21.0,<1.0.0                                       # dev — httpx request mocking (Product Service client)
+testcontainers[kafka,postgres,redis]>=4.0.0,<5.0.0         # dev — real Kafka / Postgres / Redis containers for integration tests
+
+
+# =============================================================================
+# OPERATOR NOTES
+# -----------------------------------------------------------------------------
+# 1. Install:
+#       python -m pip install -r requirements.txt
+#
+# 2. Reproducible builds (optional):
+#       pip-compile requirements.in -o requirements.lock
+#    Lockfile generation is recommended for production builds but not
+#    required by this project.
+#
+# 3. GPU-accelerated inference (TensorFlow / PyTorch):
+#    Add a requirements-extra.txt with the desired framework and install
+#    it in a separate Dockerfile stage. The default reference
+#    implementation deliberately excludes TF / Torch to keep the image
+#    size manageable. See docs/runbook/recommendation-engine.md for
+#    upgrade guidance.
+#
+# 4. Container build dependencies (Dockerfile builder stage):
+#    System packages required to compile the wheels above:
+#       libpq-dev          (psycopg)
+#       librdkafka-dev     (confluent-kafka)
+#       gfortran           (numpy / scipy / scikit-learn BLAS)
+#       libopenblas-dev    (numpy / scipy / scikit-learn BLAS)
+#       build-essential    (general C/C++ toolchain)
+#    Runtime stage installs only the shared-library counterparts:
+#       libpq5
+#       librdkafka1
+#       libopenblas0
+#
+# 5. Schema Registry compatibility:
+#    confluent-kafka[schemaregistry] transitively pulls `requests`. Do not
+#    duplicate-pin requests in this manifest.
+#
+# 6. psycopg v3 vs v2:
+#    This manifest installs psycopg v3 (`import psycopg`). Code MUST NOT
+#    use `import psycopg2`. The pgvector adapter is initialized via
+#    psycopg.types.register_types() — see
+#    src/repository/embedding_repository.py for the canonical wiring.
+# =============================================================================
