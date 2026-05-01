@@ -1,0 +1,244 @@
+# =============================================================================
+# Notification Service — Default Configuration (Base Layer)
+# =============================================================================
+# Loaded FIRST by pydantic-settings at service startup (see ../src/config/
+# settings.py). Environment-specific overrides and environment variables take
+# higher precedence.
+#
+# Loading precedence (lowest → highest):
+#   1. default.yaml           (this file — base layer)
+#   2. <ENVIRONMENT>.yaml     (if present, e.g., local.yaml for ENVIRONMENT=local)
+#   3. environment variables  (highest — see ../.env.example)
+#
+# SECURITY (AAP R-25): This file contains NO secrets. API keys, DB passwords,
+# provider credentials, and URLs bearing credentials are supplied via
+# environment variables at runtime (sourced from Kubernetes Secrets / Vault).
+# The authoritative env-var catalog lives in ../.env.example.
+#
+# CROSS-FILE COUPLING:
+#   * Topic names in `kafka.topics_consumed` MUST match event names in
+#     ../../../docs/architecture/event-catalog.md and AAP Section 0.4.2.
+#   * `service.port` (8000) MUST match the EXPOSE directive in ../Dockerfile
+#     and SERVICE_PORT in ../.env.example.
+#   * DLQ topic names MUST match AAP Section 0.4.2 fallback definitions:
+#     notifications.email.dlq, notifications.sms.dlq.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 1. service — process identity, listen port, environment classifier
+# -----------------------------------------------------------------------------
+service:
+  name: notification-service               # logical service name; emitted in every log line (AAP R-26 "service" field)
+  version: 1.0.0                           # bump on every backward-incompatible change
+  port: 8000                               # HTTP listen port; MUST match Dockerfile EXPOSE and .env.example SERVICE_PORT
+  environment: local                       # overridden by ENVIRONMENT env var; values: local | dev | stage | prod
+
+
+# -----------------------------------------------------------------------------
+# 2. logging — structured JSON log shape (AAP R-26)
+# -----------------------------------------------------------------------------
+logging:
+  level: INFO                              # overridden by LOG_LEVEL env var; values: DEBUG | INFO | WARN | ERROR
+  format: json                             # MUST remain "json" (AAP R-26 — structured JSON logs)
+  include_correlation_id: true             # AAP Section 0.4.5 — correlation-ID middleware appends this field on every log line
+
+
+# -----------------------------------------------------------------------------
+# 3. database — PostgreSQL `notification_db` (AAP Section 0.4.4)
+# -----------------------------------------------------------------------------
+# The Notification Service owns its private `notification_db` PostgreSQL
+# instance per AAP R-6 (database-per-service). Schema includes the four
+# tables defined in AAP Section 0.4.4: `notification_log`, `delivery_attempts`,
+# `templates`, and `user_channel_prefs`. The connection URL itself
+# (POSTGRES_URL) is supplied via env var so credentials never appear here.
+database:
+  # POSTGRES_URL is supplied via env var (AAP R-25 — no URL with credentials in this file)
+  pool_min_size: 2                         # minimum idle connections
+  pool_max_size: 20                        # maximum concurrent connections per instance (write-heavy workload)
+  statement_timeout_ms: 5000               # enforced server-side via SET statement_timeout
+  connect_timeout_seconds: 5               # give up on a dead host quickly
+
+
+# -----------------------------------------------------------------------------
+# 4. kafka — async event consumption (AAP R-14, R-17, R-30)
+# -----------------------------------------------------------------------------
+# The Notification Service is a TERMINAL CONSUMER (it produces no domain
+# events). The `topics_consumed` list is AUTHORITATIVE and MUST contain
+# exactly the 7 topics from AAP Section 0.4.2 + 0.5.2.2 bullet 8. The
+# `dlq_topics_produced` list MUST contain exactly the two channel DLQs
+# from AAP Section 0.4.2 fallback definitions. All inbound payloads are
+# validated against Schema Registry per AAP R-14.
+kafka:
+  # KAFKA_BOOTSTRAP + SCHEMA_REGISTRY_URL supplied via env vars (AAP R-25)
+  group_id: notification-service           # Consumer group ID
+  auto_offset_reset: earliest              # start from oldest offset for new consumer groups
+  enable_auto_commit: false                # manual commit after successful dispatch (at-least-once semantics)
+  max_poll_records: 50                     # batch size per poll
+  session_timeout_ms: 30000                # Kafka consumer session timeout
+  heartbeat_interval_ms: 10000             # ~1/3 of session_timeout per Kafka docs
+  retry_topic_suffix: .retry               # AAP R-17 — retry topic naming convention
+  dlq_topic_suffix: .dlq                   # AAP R-17 — dead-letter topic naming convention
+  consumer_retry:                          # AAP R-17 — bounded retries before DLQ routing
+    max_attempts: 3
+    backoff_ms: 500                        # initial backoff; multiplier fixed at 2.0 in application code
+  topics_consumed:                         # AAP Section 0.4.2 + 0.5.2.2 bullet 8 — 7 events consumed
+    - user.registered
+    - order.created
+    - order.cancelled
+    - order.fulfilled
+    - payment.succeeded
+    - payment.failed
+    - payment.refunded
+  dlq_topics_produced:                     # AAP Section 0.4.2 — DLQs this service writes to
+    - notifications.email.dlq
+    - notifications.sms.dlq
+
+
+# -----------------------------------------------------------------------------
+# 5. email — Email channel adapter defaults (AAP R-11, R-15, R-16)
+# -----------------------------------------------------------------------------
+# Active provider is chosen at runtime by the EMAIL_PROVIDER env var
+# (sendgrid | aws_ses) per AAP R-11 — both providers share this config
+# block so switching providers requires no code change. Provider
+# credentials (API keys, AWS access keys) are supplied via env vars at
+# runtime per AAP R-25.
+email:
+  # EMAIL_PROVIDER env var selects sendgrid | aws_ses (AAP R-11 — dual-provider concurrent support)
+  # SENDGRID_API_KEY / AWS_SES_* credentials supplied via env (AAP R-25)
+  connect_timeout_ms: 2000
+  read_timeout_ms: 5000
+  retry:                                   # AAP R-15 — exponential backoff + jitter, bounded attempts
+    max_attempts: 5
+    initial_delay_ms: 200
+    multiplier: 2.0
+    max_delay_ms: 10000
+    jitter_pct: 0.2
+  circuit_breaker:                         # AAP R-16
+    failure_rate_threshold_pct: 50
+    call_volume_threshold: 20
+    open_duration_ms: 30000
+    half_open_permitted_calls: 1
+
+
+# -----------------------------------------------------------------------------
+# 6. sms — SMS channel adapter defaults (AAP R-11, R-15, R-16)
+# -----------------------------------------------------------------------------
+# Active provider is chosen at runtime by the SMS_PROVIDER env var
+# (twilio | aws_sns) per AAP R-11 — structure intentionally MIRRORS the
+# `email` section so the dual-channel adapter pattern is uniform. Provider
+# credentials (Twilio Account SID / Auth Token, AWS access keys) are
+# supplied via env vars at runtime per AAP R-25.
+sms:
+  # SMS_PROVIDER env var selects twilio | aws_sns (AAP R-11 — dual-provider concurrent support)
+  # TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / AWS_SNS_* credentials supplied via env (AAP R-25)
+  connect_timeout_ms: 2000
+  read_timeout_ms: 5000
+  retry:                                   # AAP R-15 — exponential backoff + jitter, bounded attempts
+    max_attempts: 5
+    initial_delay_ms: 200
+    multiplier: 2.0
+    max_delay_ms: 10000
+    jitter_pct: 0.2
+  circuit_breaker:                         # AAP R-16
+    failure_rate_threshold_pct: 50
+    call_volume_threshold: 20
+    open_duration_ms: 30000
+    half_open_permitted_calls: 1
+
+
+# -----------------------------------------------------------------------------
+# 7. channel_routing — data-driven channel selection defaults (AAP R-11)
+# -----------------------------------------------------------------------------
+# These defaults are consulted ONLY when a notification template or per-user
+# preference is silent on the matter. Per-user records in the
+# `user_channel_prefs` table override these defaults at runtime when
+# `respect_user_prefs` is true. The `critical_overrides_opt_out` flag is
+# the escape hatch for security-critical events (e.g., payment.failed)
+# which must always reach the user even if they have opted out.
+channel_routing:
+  default_email_enabled: true              # email is the primary default channel
+  default_sms_enabled: false               # SMS opt-in by default (reduce cost + avoid unwanted messages)
+  respect_user_prefs: true                 # ALWAYS true in prod; user_channel_prefs table overrides defaults
+  critical_overrides_opt_out: true         # e.g., payment.failed can still SMS even if user opted out
+  quiet_hours:                             # local-time window when non-critical sends are suppressed
+    local_start: 22                        # 22:00 local
+    local_end: 7                           # 07:00 local
+  default_locale: en-US                    # fallback when user has no locale set
+
+
+# -----------------------------------------------------------------------------
+# 8. templates — body rendering engine
+# -----------------------------------------------------------------------------
+# Notification body rendering uses a sandboxed template engine. Templates
+# are stored in the `templates` table (AAP Section 0.4.4) and compiled
+# into the in-process LRU cache on first use. `strict_undefined: true`
+# guarantees that templates referencing missing context variables fail
+# loudly during testing rather than silently shipping `{{var}}` tokens.
+templates:
+  engine: jinja2                           # template engine (mirrors sibling recommendation-engine conventions)
+  cache_enabled: true                      # cache compiled templates in memory for hot-path performance
+  cache_max_size: 500                      # LRU cap
+  cache_ttl_seconds: 600                   # 10-minute TTL; supports hot template updates without restart
+  strict_undefined: true                   # fail rendering on missing template variables (surfaces bugs early)
+
+
+# -----------------------------------------------------------------------------
+# 9. scheduler — internal retry scheduler for DLQ-bound work (AAP R-17)
+# -----------------------------------------------------------------------------
+# The scheduler polls `delivery_attempts` for messages whose next-attempt
+# timestamp has elapsed and re-dispatches them through the active provider.
+# After exhausting the per-channel retry budget (`email.retry.max_attempts`
+# / `sms.retry.max_attempts`) the message is published to its channel DLQ.
+scheduler:
+  enabled: true                            # set false in test environments to disable background work
+  poll_interval_ms: 1000                   # poll the retry queue every second
+  batch_size: 50                           # process up to 50 pending sends per iteration
+  max_concurrent_sends: 10                 # bound concurrent outbound HTTP provider calls
+
+
+# -----------------------------------------------------------------------------
+# 10. observability — metrics + tracing identity (AAP R-26, R-27)
+# -----------------------------------------------------------------------------
+# Logs and metrics ship via Filebeat / Metricbeat to Logstash and
+# Elasticsearch (AAP R-27). The `/metrics` endpoint exposes Prometheus
+# format on a dedicated port so application traffic (port 8000) is never
+# scraped together with management telemetry.
+observability:
+  metrics_port: 9090                       # /metrics endpoint port (scraped by Metricbeat per AAP R-27)
+  otel_service_name: notification-service  # OpenTelemetry resource attribute; matches service.name
+
+
+# -----------------------------------------------------------------------------
+# 11. auth — JWT validation only; this service is never an issuer (AAP R-21)
+# -----------------------------------------------------------------------------
+# The Notification Service VALIDATES JWTs minted by the Auth Service. It
+# is NEVER an issuer (AAP R-21). Public keys are fetched from the Auth
+# Service JWKS endpoint and cached with a bounded TTL (AAP R-22) so that
+# key rotation propagates without service restart.
+auth:
+  # JWT_PUBLIC_KEY_URL / JWT_ISSUER supplied via env (AAP R-25)
+  jwks_cache_ttl_seconds: 3600             # bounded TTL for JWKS key cache (AAP R-22)
+  audience: notification-service           # expected `aud` JWT claim (AAP R-23 — standard OAuth 2.0 / RFC 7519)
+
+
+# -----------------------------------------------------------------------------
+# 12. http — outbound HTTP client defaults
+# -----------------------------------------------------------------------------
+# Default values applied to outbound HTTP calls that do not override them.
+# Provider-specific overrides (Email / SMS) live in their own sections
+# above. The User-Agent identifies our traffic to upstream providers
+# during incident triage.
+http:
+  user_agent: notification-service/1.0     # User-Agent header on all outbound HTTP calls
+  default_connect_timeout_ms: 1000         # default connect timeout for non-provider HTTP calls
+  default_read_timeout_ms: 5000            # default read timeout for non-provider HTTP calls
+
+
+# =============================================================================
+# END OF DEFAULT CONFIGURATION
+# -----------------------------------------------------------------------------
+# Next loading step: pydantic-settings applies any <ENVIRONMENT>.yaml overrides,
+# then applies env-var overrides. See ../.env.example for the full env-var
+# catalog and ../README.md for service-level documentation.
+# =============================================================================
