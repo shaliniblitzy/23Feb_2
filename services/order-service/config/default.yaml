@@ -1,0 +1,242 @@
+# =============================================================================
+# Order Service — Default Configuration (Base Layer)
+# =============================================================================
+# Saga Coordinator for the e-commerce checkout flow.
+# Loaded FIRST by pydantic-settings at service startup (see ../src/config/
+# settings.py). The loader performs `${VAR}` env-var substitution against the
+# process environment, then validates the merged result through Pydantic
+# models. Missing required values (no `:-default`) cause the service to exit
+# with code != 0 BEFORE accepting traffic (AAP R-19 fail-fast).
+#
+# Loading precedence (lowest → highest):
+#   1. default.yaml           (this file — base layer)
+#   2. environment variables  (highest — see ../.env.example)
+#
+# SECURITY (AAP R-25): This file contains NO secrets. Database passwords,
+# JWT signing keys, and Schema Registry credentials are supplied via env vars
+# at runtime (sourced from Kubernetes Secrets / Vault / cloud secret manager).
+# The authoritative env-var catalog lives in ../.env.example.
+#
+# CROSS-FILE COUPLING:
+#   * `service.port` (8000) MUST match the EXPOSE directive in ../Dockerfile
+#     and SERVICE_PORT in ../.env.example.
+#   * Topic names below MUST match event names in
+#     ../../../docs/architecture/event-catalog.md and AAP Section 0.4.2.
+#   * DLQ / retry topic suffixes MUST match AAP R-17 (`.dlq`, `.retry`).
+#   * `auth.jwt.audience` MUST match `service.name` and JWT_AUDIENCE in env.
+#   * `saga.*` is UNIQUE to Order Service (AAP R-18 — saga coordinator).
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 1. service — process identity, listen port, environment classifier
+# -----------------------------------------------------------------------------
+service:
+  name: ${SERVICE_NAME:-order-service}
+  port: ${SERVICE_PORT:-8000}
+  environment: ${ENVIRONMENT:-local}
+
+
+# -----------------------------------------------------------------------------
+# 2. logging — structured JSON log shape (AAP R-26)
+# -----------------------------------------------------------------------------
+logging:
+  level: ${LOG_LEVEL:-INFO}
+  format: ${LOG_FORMAT:-json}
+
+
+# -----------------------------------------------------------------------------
+# 3. database — PostgreSQL `order_db` (AAP R-6, AAP Section 0.4.4)
+# -----------------------------------------------------------------------------
+# Private to Order Service (AAP R-6). Owns 4 tables:
+# `orders`, `order_items`, `order_status_history`, `saga_state`.
+# `saga_state` is the durable backing store for the saga coordinator
+# (AAP R-18). No other service may read or write this database directly.
+database:
+  url: ${POSTGRES_URL}                      # required — fail fast at startup if missing (AAP R-19)
+  pool:
+    min_size: ${POSTGRES_POOL_MIN:-2}
+    max_size: ${POSTGRES_POOL_MAX:-20}
+  statement_timeout_ms: ${POSTGRES_STATEMENT_TIMEOUT_MS:-5000}
+  connect_timeout_seconds: ${POSTGRES_CONNECT_TIMEOUT_SECONDS:-5}
+  sslmode: ${POSTGRES_SSLMODE:-prefer}
+
+
+# -----------------------------------------------------------------------------
+# 4. kafka — async event backbone (AAP R-14, R-17, R-30)
+# -----------------------------------------------------------------------------
+# Order Service is BOTH producer and consumer:
+#   * Produces: order.created, order.cancelled, order.fulfilled
+#   * Consumes: inventory.reserved, inventory.reservation_failed,
+#               payment.succeeded, payment.failed
+# All payloads validated against Schema Registry per AAP R-14.
+kafka:
+  bootstrap: ${KAFKA_BOOTSTRAP}             # required (AAP R-19)
+  group_id: ${KAFKA_GROUP_ID:-order-service}
+  schema_registry:
+    url: ${SCHEMA_REGISTRY_URL}             # required (AAP R-14)
+    auth_user: ${SCHEMA_REGISTRY_AUTH_USER:-}
+    auth_pass: ${SCHEMA_REGISTRY_AUTH_PASS:-}
+  consumer:
+    auto_offset_reset: ${KAFKA_AUTO_OFFSET_RESET:-earliest}
+    enable_auto_commit: ${KAFKA_ENABLE_AUTO_COMMIT:-false}   # MUST be false for saga durability
+    max_poll_records: ${KAFKA_CONSUMER_MAX_POLL_RECORDS:-50}
+    session_timeout_ms: ${KAFKA_SESSION_TIMEOUT_MS:-30000}
+    heartbeat_interval_ms: ${KAFKA_HEARTBEAT_INTERVAL_MS:-10000}
+  producer:
+    acks: ${KAFKA_PRODUCER_ACKS:-all}
+    enable_idempotence: ${KAFKA_PRODUCER_ENABLE_IDEMPOTENCE:-true}
+    linger_ms: ${KAFKA_PRODUCER_LINGER_MS:-10}
+    compression_type: ${KAFKA_PRODUCER_COMPRESSION_TYPE:-zstd}
+  retry:
+    topic_suffix: ${KAFKA_RETRY_TOPIC_SUFFIX:-.retry}
+    dlq_topic_suffix: ${KAFKA_DLQ_TOPIC_SUFFIX:-.dlq}
+    max_attempts: ${KAFKA_CONSUMER_RETRY_MAX_ATTEMPTS:-3}
+    backoff_ms: ${KAFKA_CONSUMER_RETRY_BACKOFF_MS:-500}
+  topics:
+    produced:
+      order_created: ${TOPIC_ORDER_CREATED:-order.created}
+      order_cancelled: ${TOPIC_ORDER_CANCELLED:-order.cancelled}
+      order_fulfilled: ${TOPIC_ORDER_FULFILLED:-order.fulfilled}
+    consumed:
+      inventory_reserved: ${TOPIC_INVENTORY_RESERVED:-inventory.reserved}
+      inventory_reservation_failed: ${TOPIC_INVENTORY_RESERVATION_FAILED:-inventory.reservation_failed}
+      payment_succeeded: ${TOPIC_PAYMENT_SUCCEEDED:-payment.succeeded}
+      payment_failed: ${TOPIC_PAYMENT_FAILED:-payment.failed}
+    dlq:
+      order: ${TOPIC_ORDER_DLQ:-order.dlq}
+
+
+# -----------------------------------------------------------------------------
+# 5. auth — JWT validation only; this service is never an issuer (AAP R-21)
+# -----------------------------------------------------------------------------
+# Order Service VALIDATES JWTs minted by Auth Service (AAP R-21 — Auth
+# is sole issuer). Public keys fetched from JWKS endpoint and cached
+# with bounded TTL (AAP R-22) so key rotation propagates without restart.
+auth:
+  service_url: ${AUTH_SERVICE_URL}          # required (AAP R-19)
+  jwt:
+    public_key_url: ${JWT_PUBLIC_KEY_URL}   # required — JWKS endpoint (AAP R-22)
+    jwks_cache_ttl_seconds: ${JWT_JWKS_CACHE_TTL_SECONDS:-3600}
+    issuer: ${JWT_ISSUER}                   # required (AAP R-19)
+    audience: ${JWT_AUDIENCE:-order-service}
+    leeway_seconds: ${JWT_LEEWAY_SECONDS:-10}
+
+
+# -----------------------------------------------------------------------------
+# 6. saga — saga coordinator behavior (AAP R-18 — UNIQUE TO ORDER SERVICE)
+# -----------------------------------------------------------------------------
+# Drives the checkout flow:
+#   order.created -> inventory.reserved -> payment.succeeded -> order.fulfilled
+# On any failure runs compensation (release inventory + cancel order).
+# The `saga_state` table in `order_db` is the durable backing store.
+saga:                                       # AAP R-18 — saga coordinator behavior
+  step_timeout_ms: ${SAGA_STEP_TIMEOUT_MS:-10000}
+  compensation_timeout_ms: ${SAGA_COMPENSATION_TIMEOUT_MS:-30000}
+  scheduler:
+    poll_interval_ms: ${SAGA_SCHEDULER_POLL_INTERVAL_MS:-1000}
+    batch_size: ${SAGA_SCHEDULER_BATCH_SIZE:-50}
+  max_compensation_attempts: ${SAGA_MAX_COMPENSATION_ATTEMPTS:-5}
+  compensation_backoff_ms: ${SAGA_COMPENSATION_BACKOFF_MS:-2000}
+  terminal_retention_hours: ${SAGA_TERMINAL_RETENTION_HOURS:-168}
+
+
+# -----------------------------------------------------------------------------
+# 7. idempotency — POST /orders deduplication
+# -----------------------------------------------------------------------------
+# POST /orders is idempotent via a client-supplied `Idempotency-Key`
+# header. Replays within the TTL return the cached response without
+# re-running the saga (prevents duplicate orders from gateway retries).
+idempotency:
+  header: ${IDEMPOTENCY_KEY_HEADER:-Idempotency-Key}
+  ttl_hours: ${IDEMPOTENCY_KEY_TTL_HOURS:-72}
+  max_length: ${IDEMPOTENCY_KEY_MAX_LENGTH:-128}
+
+
+# -----------------------------------------------------------------------------
+# 8. http — outbound HTTP client defaults (AAP R-15, R-16)
+# -----------------------------------------------------------------------------
+# Applied to outbound HTTP calls (JWKS fetch, optional read-side queries
+# to Inventory / Payment for admin operations). Every outbound call is
+# wrapped with retry (R-15) AND circuit breaker (R-16).
+http:
+  user_agent: ${HTTP_USER_AGENT:-order-service/1.0}
+  default_connect_timeout_ms: ${HTTP_DEFAULT_CONNECT_TIMEOUT_MS:-2000}
+  default_read_timeout_ms: ${HTTP_DEFAULT_READ_TIMEOUT_MS:-10000}
+  retry:                                    # AAP R-15 — exponential backoff + jitter, bounded attempts
+    max_attempts: ${HTTP_RETRY_MAX_ATTEMPTS:-3}
+    initial_backoff_ms: ${HTTP_RETRY_INITIAL_BACKOFF_MS:-200}
+    max_backoff_ms: ${HTTP_RETRY_MAX_BACKOFF_MS:-2000}
+    multiplier: ${HTTP_RETRY_MULTIPLIER:-2.0}
+    jitter: ${HTTP_RETRY_JITTER:-true}
+  circuit_breaker:                          # AAP R-16 — failure rate / volume / open duration / half-open probes
+    failure_threshold: ${HTTP_CB_FAILURE_THRESHOLD:-10}
+    failure_window_seconds: ${HTTP_CB_FAILURE_WINDOW_SECONDS:-30}
+    open_duration_seconds: ${HTTP_CB_OPEN_DURATION_SECONDS:-30}
+    half_open_probes: ${HTTP_CB_HALF_OPEN_PROBES:-2}
+
+
+# -----------------------------------------------------------------------------
+# 9. observability — OpenTelemetry, metrics, correlation-ID (AAP R-26, R-27, R-28)
+# -----------------------------------------------------------------------------
+# Logs and metrics ship via Filebeat / Metricbeat to Logstash and
+# Elasticsearch (AAP R-27). `/metrics` exposes Prometheus format on a
+# dedicated port so application traffic (8000) is never scraped together
+# with management telemetry.
+observability:
+  otel:
+    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    service_name: ${OTEL_SERVICE_NAME:-order-service}
+    resource_attributes: ${OTEL_RESOURCE_ATTRIBUTES:-service.namespace=ecommerce}
+    sampler: ${OTEL_TRACES_SAMPLER:-parentbased_traceidratio}
+    sampler_arg: ${OTEL_TRACES_SAMPLER_ARG:-0.1}
+  metrics:
+    port: ${METRICS_PORT:-9090}
+    path: ${METRICS_PATH:-/metrics}
+  correlation_id_header: ${CORRELATION_ID_HEADER:-X-Correlation-ID}
+
+
+# -----------------------------------------------------------------------------
+# 10. health — liveness / readiness probe paths (AAP R-19)
+# -----------------------------------------------------------------------------
+# Liveness confirms the process is alive; readiness confirms downstream
+# dependencies (Postgres, Kafka consumer assignment, Schema Registry,
+# JWKS cache) are all reachable. Per AAP R-19, missing critical deps at
+# startup MUST cause the service to fail fast.
+health:
+  liveness_path: ${HEALTH_LIVENESS_PATH:-/health/live}
+  readiness_path: ${HEALTH_READINESS_PATH:-/health/ready}
+  ready_timeout_ms: ${HEALTH_READY_TIMEOUT_MS:-2000}
+
+
+# -----------------------------------------------------------------------------
+# 11. order — defensive domain limits enforced at the API edge
+# -----------------------------------------------------------------------------
+# Reject pathological requests before they touch the database or saga
+# coordinator. Protects the platform from abuse and shields downstream
+# services (Inventory's reservation engine, Payment's provider rate
+# limits) from oversized orders.
+order:
+  max_items: ${ORDER_MAX_ITEMS:-200}
+  max_quantity_per_item: ${ORDER_MAX_QUANTITY_PER_ITEM:-999}
+  min_total_amount_minor_units: ${ORDER_MIN_TOTAL_AMOUNT_MINOR_UNITS:-1}
+  max_total_amount_minor_units: ${ORDER_MAX_TOTAL_AMOUNT_MINOR_UNITS:-10000000}
+  supported_currencies: ${ORDER_SUPPORTED_CURRENCIES:-USD,EUR,GBP,INR,AUD,CAD}
+
+
+# =============================================================================
+# END OF DEFAULT CONFIGURATION
+# -----------------------------------------------------------------------------
+# Required env vars (no default, fail-fast per AAP R-19):
+#   POSTGRES_URL, KAFKA_BOOTSTRAP, SCHEMA_REGISTRY_URL,
+#   AUTH_SERVICE_URL, JWT_PUBLIC_KEY_URL, JWT_ISSUER
+#
+# REMINDERS:
+#   * NO secrets in this file (AAP R-25 — env-var substitution only).
+#   * `kafka.consumer.enable_auto_commit` MUST be false — saga coordinator
+#     commits offsets only after durable saga_state writes.
+#   * `kafka.producer.enable_idempotence` MUST be true and `acks` MUST be all
+#     — order events are mission-critical and must not be silently dropped.
+#   * The `saga:` section is UNIQUE to Order Service (AAP R-18) — no other
+#     service has saga state machine timeouts and compensation policies.
+# =============================================================================
