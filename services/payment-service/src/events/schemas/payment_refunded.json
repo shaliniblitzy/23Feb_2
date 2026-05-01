@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://payment-service.local/schemas/payment_refunded.json",
+  "title": "PaymentRefunded",
+  "description": "Event emitted by the Payment Service after a successful refund through the originating provider.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "event_type",
+    "event_version",
+    "occurred_at",
+    "payment_id",
+    "refund_id",
+    "order_id",
+    "customer_id",
+    "amount",
+    "currency",
+    "provider",
+    "correlation_id"
+  ],
+  "properties": {
+    "event_id": {"type": "string", "format": "uuid"},
+    "event_type": {"type": "string", "const": "PaymentRefunded"},
+    "event_version": {"type": "integer", "minimum": 1, "const": 1},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "payment_id": {"type": "string", "format": "uuid"},
+    "refund_id": {"type": "string", "format": "uuid"},
+    "order_id": {"type": "string", "format": "uuid"},
+    "customer_id": {"type": "string", "format": "uuid"},
+    "amount": {"type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?$"},
+    "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
+    "provider": {"type": "string", "enum": ["stripe", "razorpay"]},
+    "provider_refund_id": {"type": ["string", "null"]},
+    "reason": {"type": ["string", "null"]},
+    "correlation_id": {"type": "string"}
+  }
+}
