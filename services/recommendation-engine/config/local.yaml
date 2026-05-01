@@ -1,0 +1,70 @@
+# =============================================================================
+# Recommendation Engine — Local Development Overrides
+# =============================================================================
+# Applied when ENVIRONMENT=local. Merged ON TOP of default.yaml by pydantic-
+# settings in ../src/config/settings.py.
+#
+# Loading precedence (lowest → highest):
+#   1. default.yaml    (base layer)
+#   2. local.yaml      (this file — overrides for local dev)
+#   3. environment variables  (highest — see ../.env.example)
+#
+# Contains ONLY overrides — every other key inherits from default.yaml.
+# NO SECRETS (AAP R-25): DB/Redis/Kafka URLs come from ../.env at runtime.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# logging — verbose output for local development
+# -----------------------------------------------------------------------------
+# Only `level` is overridden. `format` and `include_fields` are NOT redefined
+# so they inherit from default.yaml — JSON shape stays identical to production
+# (AAP R-26) and tooling such as `jq` and structlog parsing keeps working.
+logging:
+  level: DEBUG            # Overrides default (INFO) for richer local development logs
+                          # Format stays JSON (inherited from default.yaml) per AAP R-26
+
+
+# -----------------------------------------------------------------------------
+# http.cors — permit local frontend dev servers
+# -----------------------------------------------------------------------------
+# default.yaml sets `allowed_origins: []` (closed by default). In production
+# the list is supplied by CORS_ALLOWED_ORIGINS env var or a K8s ConfigMap.
+# Locally we pre-seed the two most common dev ports so a developer running a
+# Next.js / React frontend on their laptop can hit this service immediately.
+http:
+  cors:
+    allowed_origins:
+      - http://localhost:3000     # Next.js / React dev server
+      - http://localhost:8080     # Alternate frontend dev port
+
+
+# -----------------------------------------------------------------------------
+# observability.otel — explicitly disabled locally
+# -----------------------------------------------------------------------------
+# Same value as default.yaml, restated here to communicate intent: a local
+# laptop typically has NO OTEL collector running, so we deliberately keep the
+# exporter off. Flip to true only when running an OTLP collector locally.
+# Prometheus scraping (observability.prometheus) is left inherited (enabled).
+observability:
+  otel:
+    enabled: false              # Local dev: no OTEL collector typically running
+
+
+# -----------------------------------------------------------------------------
+# (OPTIONAL) fallback — faster popularity refresh in dev
+# -----------------------------------------------------------------------------
+# Uncommenting the block below shortens the popularity refresh cadence so
+# developers can observe `rec_cache` repopulating quickly when iterating on
+# the fallback path. Leave commented out by default; enable per-developer.
+# fallback:
+#   popularity_refresh_interval_seconds: 30   # faster local iteration (default: 300)
+
+
+# =============================================================================
+# LOCAL PLACEHOLDERS
+# -----------------------------------------------------------------------------
+# Actual URLs for Postgres/Redis/Kafka/Auth/Product come from the sibling
+# `.env` file (copy from `../.env.example`). This YAML file does NOT contain
+# any URLs or secrets by design (AAP R-25).
+# =============================================================================
