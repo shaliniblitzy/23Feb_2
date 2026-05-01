@@ -49,6 +49,7 @@
 fastapi>=0.110.0,<1.0.0                                    # AAP Section 0.3.1 — OpenAPI tooling / sync HTTP entrypoints
 pydantic>=2.6.0,<3.0.0                                     # Request / response model validation (FastAPI v2 stack)
 pydantic-settings>=2.2.0,<3.0.0                            # 12-factor env-var configuration loader
+email-validator>=2.0.0,<3.0.0                              # Required by `pydantic.EmailStr` (UserRegisteredEvent.email validation)
 starlette>=0.37.0,<1.0.0                                   # FastAPI substrate (pinned for deterministic resolution)
 uvicorn[standard]>=0.29.0,<1.0.0                           # ASGI server (Dockerfile CMD); [standard] -> uvloop + httptools
 
