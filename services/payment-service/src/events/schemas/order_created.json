@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://payment-service.local/schemas/order_created.json",
+  "title": "OrderCreated",
+  "description": "Event emitted by the Order Service when a new order is created and ready for payment capture. Consumed by the Payment Service to trigger a charge attempt.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "event_type",
+    "event_version",
+    "occurred_at",
+    "order_id",
+    "customer_id",
+    "amount",
+    "currency",
+    "payment_method_token"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "UUID4 — uniquely identifies this Kafka event delivery (idempotency key in handlers)."
+    },
+    "event_type": {
+      "type": "string",
+      "const": "OrderCreated"
+    },
+    "event_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Schema version. AAP R-31."
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 / ISO 8601 with timezone."
+    },
+    "correlation_id": {
+      "type": "string",
+      "description": "Optional request correlation ID; consumer also reads from x-correlation-id header."
+    },
+    "order_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "UUID of the order being paid."
+    },
+    "customer_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "UUID of the customer placing the order."
+    },
+    "amount": {
+      "type": "string",
+      "pattern": "^[0-9]+(\\.[0-9]+)?$",
+      "description": "Decimal amount as a string to preserve precision (no float rounding)."
+    },
+    "currency": {
+      "type": "string",
+      "pattern": "^[A-Z]{3}$",
+      "description": "ISO 4217 currency code (UPPERCASE)."
+    },
+    "payment_method_token": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Tokenized payment method reference (e.g., pm_xxx for Stripe, pay_xxx for Razorpay)."
+    },
+    "merchant_pref": {
+      "type": ["string", "null"],
+      "enum": ["stripe", "razorpay", null],
+      "description": "Optional merchant override; honored only when settings.provider_routing.respect_merchant_override=True."
+    },
+    "region": {
+      "type": ["string", "null"],
+      "description": "Optional region/country code (e.g., 'IN', 'US'). Used for region-bias routing."
+    },
+    "billing_country": {
+      "type": ["string", "null"],
+      "description": "Optional ISO 3166-1 alpha-2 country code for the billing address."
+    }
+  }
+}
