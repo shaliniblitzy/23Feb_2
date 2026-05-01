@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://payment-service.local/schemas/order_cancelled.json",
+  "title": "OrderCancelled",
+  "description": "Event emitted by the Order Service when an order is cancelled. Consumed by the Payment Service to trigger a refund.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "event_type",
+    "event_version",
+    "occurred_at",
+    "order_id"
+  ],
+  "properties": {
+    "event_id": {"type": "string", "format": "uuid"},
+    "event_type": {"type": "string", "const": "OrderCancelled"},
+    "event_version": {"type": "integer", "minimum": 1},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "correlation_id": {"type": "string"},
+    "order_id": {"type": "string", "format": "uuid"},
+    "customer_id": {"type": ["string", "null"], "format": "uuid"},
+    "cancellation_reason": {
+      "type": ["string", "null"],
+      "description": "Optional human-readable reason; emitted to the metadata of the refunds row."
+    }
+  }
+}
