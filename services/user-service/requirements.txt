@@ -1,0 +1,418 @@
+# =============================================================================
+# User Service — Python Dependencies
+# =============================================================================
+# Target runtime  : Python 3.11+
+# Service domain  : User profile, account, preference, and address management
+#                   for the e-commerce platform. Owns user_db (PostgreSQL)
+#                   per AAP Rule R-6 (database-per-service) with the four
+#                   tables (`users`, `user_profiles`, `user_preferences`,
+#                   `user_addresses`) per AAP Section 0.4.4. Consumes
+#                   `user.registered` from the Auth Service and produces
+#                   `user.updated` / `user.deleted` events to Kafka per AAP
+#                   Section 0.4.2 / R-30 for downstream consumption by
+#                   Notification Service and Recommendation Engine. The
+#                   service is fronted by the API Gateway per AAP Section
+#                   0.5.1 (Mermaid edge: `Gateway -->|REST /users| UserSvc`).
+# Source of truth : Agent Action Plan (AAP) Section 0.3.1 (public packages),
+#                   Section 0.3.3 (dependency updates), Section 0.4.2 (Kafka
+#                   producer/consumer + correlation-ID propagation), Section
+#                   0.4.4 (user_db PostgreSQL schema), Section 0.5.2.5
+#                   (per-service manifests), and applicable rules R-6
+#                   (database-per-service), R-7 (polyglot persistence —
+#                   PostgreSQL for relational/transactional domains), R-9
+#                   (alembic migrations), R-13 (correlation-ID propagation
+#                   across HTTP and Kafka), R-14 (Schema Registry), R-15
+#                   (retry with exponential backoff + jitter), R-16
+#                   (circuit breaker), R-17 (DLQ / retry topics), R-19
+#                   (liveness / readiness probes), R-21 / R-22 (JWT
+#                   validation with bounded TTL JWKS cache), R-23 (OAuth
+#                   2.0 client utilities), R-26 / R-27 (structured JSON
+#                   logs shipped via Beats to Logstash + Prometheus
+#                   metrics), R-30 (event naming conventions:
+#                   <domain>.<verb>).
+#
+# Pinning policy  : Compatible-release pins (`~=`) per Phase 1 Pin Strategy
+#                   in the user-service agent prompt. Compatible-release
+#                   accepts safe minor and patch updates while preventing
+#                   breaking major-version drift. No package is left bare;
+#                   no `==` pinning is used unless accompanied by a
+#                   "# pin: <reason>" comment. Style mirrors the canonical
+#                   monorepo Python stack (FastAPI + Pydantic v2 +
+#                   SQLAlchemy 2.0 + psycopg v3 + confluent-kafka +
+#                   tenacity/pybreaker + pyjwt/cachetools + structlog +
+#                   OpenTelemetry + prometheus-client) used by sibling
+#                   services for monorepo cognitive consistency and
+#                   grep-ability.
+#
+# Subtractive    : This service deliberately omits dependencies that live
+# scope            in sibling services. Per AAP architectural separation:
+#                     - NO stripe / razorpay -> payment-service domain
+#                     - NO twilio / sendgrid / boto3 SES|SNS -> notification-
+#                       service domain
+#                     - NO jinja2 / babel / markupsafe -> notification-
+#                       service template engine
+#                     - NO redis / hiredis / pgvector -> recommendation-
+#                       engine domain
+#                     - NO scikit-learn / numpy / scipy / tensorflow /
+#                       torch / sentence-transformers -> recommendation-
+#                       engine domain
+#                     - NO motor / pymongo / dnspython -> product-service
+#                       (MongoDB) domain
+#                     - NO apscheduler -> inventory-service reservation
+#                       expiry scheduler domain
+#                     - NO temporal / cadence / saga libs -> order-service
+#                       saga coordinator domain
+#                   Adding any of the above broadens the User Service's
+#                   responsibility surface in violation of AAP R-30
+#                   (events are owned by the producing domain) and AAP
+#                   architectural separation between services.
+#
+# User-service  : User-service-specific additions (NOT present in every
+# specifics       sibling) include `phonenumbers` for E.164 phone
+#                 validation, `pycountry` for ISO-3166 country code
+#                 validation, `email-validator` (explicit pin even though
+#                 transitively pulled by `pydantic[email]`), `uuid7` for
+#                 time-ordered UUID primary keys on the high-volume
+#                 `users` and `user_addresses` tables, `tzdata` for IANA
+#                 timezone resolution required by `user_preferences.
+#                 timezone`, and `authlib` for OAuth 2.0 client utilities
+#                 used during service-to-service token introspection per
+#                 AAP R-23.
+#
+# Install         : python -m pip install -r requirements.txt
+# Compile wheels  : pip wheel -r requirements.txt -w /tmp/wheels
+# Audit CVEs      : pip-audit -r requirements.txt
+# Resolve check   : pip install --dry-run -r requirements.txt
+# =============================================================================
+
+
+# === Group 1 — Web Framework & ASGI Runtime ===
+# FastAPI exposes the synchronous user-management endpoints — POST /users,
+# GET /users/{id}, PATCH /users/{id}, DELETE /users/{id}, GET /users/me,
+# GET /users/{id}/addresses, POST /users/{id}/addresses, GET /health/live,
+# GET /health/ready, GET /metrics — fronted by the API Gateway per AAP
+# Section 0.5.1. uvicorn[standard] adds uvloop + httptools for production
+# throughput; the Dockerfile CMD runs `uvicorn ... --loop uvloop --http
+# httptools` on Linux. uvloop is gated by `sys_platform != "win32"`
+# because uvloop has no Windows wheel (developers on Windows fall back
+# to the asyncio default event loop transparently). starlette is the
+# FastAPI ASGI substrate — pinned explicitly so security patches resolve
+# deterministically across the monorepo. python-multipart parses form
+# bodies for any future avatar / file upload endpoint. httptools is the
+# production HTTP parser used by uvicorn[standard]; pinning it here
+# ensures CVE-driven bumps are auditable in this manifest.
+fastapi~=0.110                              # primary FastAPI web framework (AAP Section 0.3.1 — OpenAPI tooling)
+httptools~=0.6                              # high-perf HTTP parser used by uvicorn[standard]
+python-multipart~=0.0.9                     # form parsing for future avatar / file upload endpoints
+starlette~=0.36                             # explicit pin (FastAPI ships starlette but pinning is operationally safer)
+uvicorn[standard]~=0.27                     # ASGI server with uvloop+httptools (Dockerfile CMD)
+uvloop~=0.19; sys_platform != "win32"       # high-perf event loop (Linux/macOS); excluded on Windows
+
+
+# === Group 2 — Settings, Validation, Serialization ===
+# Pydantic v2 powers request/response validation AND validates the Kafka
+# event payloads emitted by the user lifecycle (`user.updated`,
+# `user.deleted`). pydantic-settings drives 12-factor environment-variable
+# configuration loading and fails fast on missing required variables per
+# AAP R-19. email-validator is pinned explicitly even though
+# `pydantic[email]` pulls it transitively — the explicit pin avoids
+# surprises if Pydantic ever swaps validators, and the User Service is the
+# canonical source-of-truth for the user email used by every downstream
+# notification. phonenumbers (the libphonenumber Python port) validates
+# E.164 phone numbers in `user_profiles.phone` and `user_addresses.phone`;
+# this dep is user-service-specific because no sibling service stores
+# user-supplied phone numbers. pycountry validates ISO-3166 alpha-2 / alpha-3
+# country codes in `user_addresses.country_code`; also user-service-specific.
+# orjson backs FastAPI's ORJSONResponse for fast JSON serialization and is
+# used by the Kafka event payload encoder.
+email-validator~=2.1                        # RFC 5321 email address validation (canonical user email source-of-truth)
+orjson~=3.9                                 # fast JSON serialization for FastAPI responses + Kafka event payloads
+phonenumbers~=8.13                          # E.164 phone validation for user_profiles.phone and user_addresses.phone
+pycountry~=23.12                            # ISO-3166 country code validation for user_addresses
+pydantic[email]~=2.6                        # request/response model validation; [email] extra pulls email-validator
+pydantic-settings~=2.2                      # 12-factor env-var configuration loader (R-19 fail-fast on startup)
+
+
+# === Group 3 — Database (PostgreSQL `user_db`) — AAP R-6, R-7, R-9 ===
+# The User Service owns its own PostgreSQL data store per AAP R-6
+# (database-per-service). The store is `user_db` with four tables —
+# `users`, `user_profiles`, `user_preferences`, `user_addresses` — per
+# AAP Section 0.4.4. psycopg v3 (NOT psycopg2) provides native asyncio
+# support and a built-in connection pool sized via env vars
+# (DB_POOL_MIN / DB_POOL_MAX). The [binary,pool] extras provide the
+# bundled libpq wheel + ConnectionPool implementation, eliminating the
+# need for a system libpq install in the runtime container. SQLAlchemy
+# v2 layers async ORM / query-builder semantics on top via the
+# `postgresql+psycopg://` dialect URL; the [asyncio] extra makes the
+# async-only intent explicit. alembic runs the DDL migrations under
+# `services/user-service/migrations/versions/` on container startup or
+# via a dedicated migration job per AAP R-9.
+alembic~=1.13                               # AAP R-9 — migration runner for user_db tables
+psycopg[binary,pool]~=3.1                   # PostgreSQL driver v3 (binary wheel + connection pool)
+sqlalchemy[asyncio]~=2.0                    # async ORM / query builder over psycopg v3
+
+
+# === Group 4 — Kafka Producer / Consumer + Schema Registry — AAP R-14, R-30 ===
+# confluent-kafka wraps librdkafka for high-throughput produce + consume;
+# the [avro,schemaregistry,json] extras stream events through Schema
+# Registry per AAP R-14 to enforce backward-compatible schema evolution.
+# fastavro is the compiled Avro serializer used by the Schema Registry
+# Avro encoder.
+#
+# The User Service plays a DUAL role on the Kafka bus per AAP Section
+# 0.4.2 (R-30: <domain>.<verb> event naming):
+#
+#   PRODUCER of the `user.*` domain topics:
+#     * user.updated  -> downstream: notification-service, recommendation-engine
+#     * user.deleted  -> downstream: notification-service, recommendation-engine
+#
+#   CONSUMER of the `user.registered` topic emitted by the Auth Service:
+#     * user.registered -> create the corresponding user profile row
+#
+# Failures route to `<topic>.retry` then `<topic>.dlq` per AAP R-17. The
+# producer is configured with `enable.idempotence=true` and `acks=all`
+# for event durability; the consumer uses MANUAL offset commits
+# (`enable.auto.commit=false`) so an offset is committed ONLY AFTER the
+# corresponding profile-creation has been durably written to Postgres.
+# All extras are installed even though the User Service only needs Avro
+# for Schema Registry validation — the extras footprint is small and
+# operational consistency with sibling services simplifies CI/CD scripting.
+confluent-kafka[avro,schemaregistry,json]~=2.3   # AAP R-14 (Schema Registry) + R-17 (retry/DLQ) + R-30 (event naming)
+fastavro~=1.9                                    # fast Avro encode/decode used by confluent-kafka
+
+
+# === Group 5 — Resilience (AAP R-15, R-16, R-17) ===
+# tenacity provides retry decorators with exponential backoff + jitter,
+# bounded attempts, and configurable predicates per AAP R-15. Retries
+# protect every Kafka produce attempt, every JWKS fetch, and every
+# outbound HTTP call. pybreaker wraps each outbound call site with a
+# thread-safe in-process circuit breaker (open / half-open / closed)
+# per AAP R-16; the open-state of any critical breaker (Kafka, JWKS) is
+# reflected on `/health/ready` per AAP R-19 — the readiness probe fails
+# closed until the breaker enters half-open / closed. Both libraries are
+# explicitly listed as canonical examples in AAP Section 0.3.1 alongside
+# resilience4j and opossum, and they match the resilience stack used by
+# sibling services for operational consistency.
+pybreaker~=1.0                              # AAP R-16 — circuit breaker (open / half-open / closed states)
+tenacity~=8.2                               # AAP R-15 — retry w/ exponential backoff + jitter, bounded attempts
+
+
+# === Group 6 — Auth / JWT (AAP R-21, R-22, R-23) ===
+# Per AAP R-21, the Auth Service is the SOLE issuer of JWT tokens; this
+# service VALIDATES ONLY, never signs. pyjwt[crypto] supports RS256 /
+# ES256 / EdDSA verification using public keys fetched from the Auth
+# Service JWKS endpoint. cachetools provides the bounded-TTL JWKS key
+# cache mandated by AAP R-22 — keys are refreshed automatically without
+# restart, which enables seamless key rotation in the Auth Service. The
+# cryptography library is transitively installed by `pyjwt[crypto]`;
+# pinning it explicitly here makes CVE-driven version bumps auditable in
+# this single manifest rather than buried in transitive resolution.
+# authlib provides OAuth 2.0 client utilities (token introspection helpers,
+# JWKS fetch helpers, RFC 6749 / RFC 6750 / RFC 7591 primitives) per AAP
+# R-23; it is reserved here for service-to-service token introspection
+# flows and any operator-driven OAuth 2.0 client integrations.
+authlib~=1.3                                # AAP R-23 — OAuth 2.0 client utilities (RFC 6749/6750)
+cachetools~=5.3                             # AAP R-22 — bounded TTL cache for JWKS keys
+cryptography~=42.0                          # required by pyjwt[crypto] for RS256/EdDSA verification (CVE patch cadence)
+pyjwt[crypto]~=2.8                          # AAP R-21 / R-22 — JWT validation only (RS256/ES256/EdDSA)
+
+
+# === Group 7 — HTTP Client (Outbound) ===
+# httpx is the async-first HTTP client used by the User Service for two
+# narrow purposes:
+#
+#   1. JWKS public-key fetch from the Auth Service (AAP R-22 — bounded
+#      TTL JWKS cache). The fetch is wrapped in `tenacity` retry +
+#      `pybreaker` circuit-breaker decorators with cached fall-back.
+#
+#   2. Occasional read-side metadata lookups across services (e.g.,
+#      Auth Service userinfo endpoints during reconciliation jobs). All
+#      such lookups are wrapped in resilience primitives and fall back
+#      gracefully on circuit-open per AAP R-15 / R-16 / R-20.
+#
+# Cross-service HTTP calls are deliberately minimized in favor of
+# asynchronous Kafka choreography to preserve service autonomy (AAP R-32).
+httpx~=0.27                                 # used for JWKS fetch and any other outbound HTTP
+
+
+# === Group 8 — Logging (AAP R-26) ===
+# All logs are emitted as structured JSON with the canonical fields per
+# AAP R-26 (timestamp, level, service, correlation_id, user_id, route,
+# method, status, latency_ms, message). structlog is the application-
+# code-facing structured logger; python-json-logger provides the JSON
+# formatter for stdlib `logging` so uvicorn `--log-config` and any
+# third-party library logger emit the same JSON shape. Filebeat tails
+# container stdout and ships to Logstash per AAP R-27.
+python-json-logger~=2.0                     # JSON formatter for stdlib logging (used by uvicorn --log-config)
+structlog~=24.1                             # AAP R-26 — structured JSON logger across application code
+
+
+# === Group 9 — Observability (AAP R-13, R-27) ===
+# OpenTelemetry primitives propagate the X-Correlation-ID through HTTP
+# (auto-instrumented FastAPI + httpx) and SQLAlchemy spans (auto-
+# instrumented) for end-to-end tracing of the create-user / update-user
+# flow. The correlation ID is also injected into outbound Kafka message
+# headers so downstream services can stitch the trace continuously per
+# AAP R-13. The OTLP exporter ships traces to a collector that in turn
+# fans out to Elasticsearch via the Logstash pipeline. Prometheus
+# metrics surface at /metrics for Metricbeat scraping per AAP R-27.
+#
+# The instrumentation set covers every cross-cutting hop:
+#   - opentelemetry-instrumentation-fastapi      — incoming HTTP requests
+#   - opentelemetry-instrumentation-httpx        — outgoing HTTP (JWKS,
+#                                                  read-side lookups)
+#   - opentelemetry-instrumentation-sqlalchemy   — every DB query
+#   - opentelemetry-instrumentation-logging      — log/trace correlation
+#                                                  (injects trace_id +
+#                                                  span_id into log
+#                                                  records for AAP R-13)
+opentelemetry-api~=1.24                            # OTel tracing API — correlation-ID propagation primitives
+opentelemetry-exporter-otlp~=1.24                  # OTLP exporter for traces / metrics
+opentelemetry-instrumentation-fastapi~=0.45b0      # auto-instrument FastAPI request lifecycle
+opentelemetry-instrumentation-httpx~=0.45b0        # auto-instrument outbound httpx (JWKS, read-side lookups)
+opentelemetry-instrumentation-logging~=0.45b0      # inject trace_id + span_id into log records (AAP R-13)
+opentelemetry-instrumentation-sqlalchemy~=0.45b0   # auto-instrument SQLAlchemy queries (user_db writes/reads)
+opentelemetry-sdk~=1.24                            # OTel SDK — span processors, exporters
+prometheus-client~=0.20                            # AAP R-27 — /metrics endpoint scraped by Metricbeat
+
+
+# === Group 10 — Time & UUID ===
+# python-dateutil parses RFC 3339 timestamps in events (e.g., the
+# `occurred_at` envelope field on every domain event) where naive
+# datetime arithmetic is insufficient. tzdata is the IANA timezone
+# database needed for timezone-aware locale handling per
+# `user_preferences.timezone` — Python's stdlib `zoneinfo` requires
+# tzdata, and the python:3.11-slim-bookworm minimal image does NOT
+# always ship the full IANA database. uuid7 generates time-ordered
+# (RFC 9562 v7) UUIDs for `users.id` and `user_addresses.id` to
+# preserve B-tree insertion locality on these high-volume tables —
+# UUIDv4's random distribution causes pathological page splits at
+# scale, which uuid7 avoids by encoding the millisecond timestamp in
+# the high bits.
+python-dateutil~=2.9                        # parses RFC 3339 timestamps in events
+tzdata~=2024.1                              # IANA tz database — required for user_preferences.timezone
+uuid7~=0.1                                  # time-ordered UUIDs for users.id / user_addresses.id (B-tree locality)
+
+
+# === Group 11 — CLI / Operational Helpers ===
+# click backs the management scripts under `services/user-service/src/cli/`
+# (PII anonymization audit, manual outbox flush, dead-letter requeue,
+# user-id remapping). rich produces human-readable colorized output for
+# operator-facing scripts (tables, progress bars, syntax-highlighted
+# diff output for audit reports). Both are runtime deps because
+# operational scripts ship inside the same container image.
+click~=8.1                                  # used by management scripts (PII audit, manual outbox flush)
+rich~=13.7                                  # human-readable CLI output for operational scripts
+
+
+# === Group 12 — Test Dependencies ===
+# Test dependencies are co-located with prod deps in `requirements.txt`
+# (sibling pattern). Some monorepos split into `requirements-dev.txt`;
+# this monorepo intentionally does NOT to keep image-time test execution
+# simple and to ensure CI runs against the exact image that production
+# does. testcontainers spins up real Kafka and Postgres containers for
+# integration tests so consumer / persistence behavior is exercised
+# against the genuine wire protocol. respx mocks outbound httpx calls
+# (JWKS fetch, Auth Service introspection) for unit-level tests that
+# must run without a live Auth Service. freezegun and time-machine
+# enable deterministic time-based tests (e.g., DOB age check, JWKS TTL
+# expiry, password-reset token expiration). pytest-asyncio brings async
+# test support; pytest-cov measures coverage; coverage[toml] surfaces
+# coverage configuration in `pyproject.toml`. pytest-mock provides the
+# `mocker` fixture for ergonomic mocking of stdlib calls.
+coverage[toml]~=7.4                         # dev — coverage measurement w/ pyproject.toml support
+freezegun~=1.4                              # dev — deterministic time-based tests (DOB age check, token expiry)
+pytest~=8.0                                 # dev — primary test runner
+pytest-asyncio~=0.23                        # dev — async test support
+pytest-cov~=4.1                             # dev — coverage reporting
+pytest-mock~=3.12                           # dev — `mocker` fixture for ergonomic mocking
+respx~=0.21                                 # dev — httpx request mocking (JWKS / Auth Service stubs)
+testcontainers[kafka,postgres]~=3.7         # dev — real Kafka / Postgres containers for integration tests
+time-machine~=2.13                          # dev — additional time-mocking utility (sibling pattern)
+
+
+# =============================================================================
+# OPERATOR NOTES
+# -----------------------------------------------------------------------------
+# 1. Install:
+#       python -m pip install -r requirements.txt
+#
+# 2. Reproducible builds (optional):
+#       pip-compile requirements.txt -o requirements.lock
+#    Lockfile generation is recommended for production builds but not
+#    required by this project. Per AAP Section 0.3.1 implementation note,
+#    the downstream build pipeline MUST resolve specific patch versions
+#    at build time and pin them in a generated `requirements-lock.txt`
+#    for production builds. This file (`requirements.txt`) sets the
+#    SUPPORTED RANGE; the lock file pins the EXACT version.
+#
+# 3. Container build dependencies (Dockerfile builder stage):
+#    System packages required to compile the wheels above:
+#       libpq-dev          (psycopg)
+#       librdkafka-dev     (confluent-kafka)
+#       libssl-dev         (cryptography)
+#       libffi-dev         (cryptography / cffi)
+#       build-essential    (general C/C++ toolchain)
+#       python3-dev        (CPython headers)
+#    Runtime stage installs only the shared-library counterparts:
+#       libpq5
+#       librdkafka1
+#       libssl3
+#
+# 4. Schema Registry compatibility:
+#    confluent-kafka[schemaregistry] transitively pulls `requests`. Do
+#    not duplicate-pin `requests` in this manifest.
+#
+# 5. psycopg v3 vs v2:
+#    This manifest installs psycopg v3 (`import psycopg`). Code MUST NOT
+#    use `import psycopg2`. SQLAlchemy 2.0 async wires through the
+#    `postgresql+psycopg://` dialect URL — see
+#    src/repository/user_repository.py for the canonical wiring.
+#
+# 6. JWT validation only (AAP R-21):
+#    This service holds NO signing keys. pyjwt is used solely to verify
+#    RS256 / ES256 / EdDSA signatures against the Auth Service's public
+#    JWKS keyset. Any code path that attempts to call `jwt.encode()`
+#    with an asymmetric private key violates the architectural contract
+#    and must be rejected in code review.
+#
+# 7. Kafka consumer offset semantics:
+#    KAFKA_ENABLE_AUTO_COMMIT=false is the production default. The
+#    application MUST call `consumer.commit()` MANUALLY after the user
+#    profile mutation triggered by the consumed message has been durably
+#    written to Postgres in the same logical transaction. Without manual
+#    commit, a crash between consumption and persistence would lose the
+#    user record and break exactly-once-effect semantics.
+#
+# 8. Time-ordered UUIDs (uuid7):
+#    The User Service generates `users.id` and `user_addresses.id` using
+#    uuid7 (RFC 9562 v7) instead of uuid4 to preserve B-tree insertion
+#    locality on these high-volume tables. Migration scripts MUST use
+#    `UUID DEFAULT gen_random_uuid_v7()` or the application-side
+#    `uuid7.uuid7()` generator — never `uuid_generate_v4()` — to keep
+#    insert performance bounded under load.
+#
+# 9. Subtractive scope — packages explicitly excluded:
+#    The following packages live in sibling services and MUST NOT appear
+#    in this manifest:
+#       stripe / razorpay         -> services/payment-service/
+#       twilio / sendgrid         -> services/notification-service/
+#       boto3 / botocore (SES/SNS) -> services/notification-service/
+#       jinja2 / babel / markupsafe -> services/notification-service/
+#       redis / hiredis           -> services/recommendation-engine/
+#       pgvector                  -> services/recommendation-engine/
+#       scikit-learn / numpy / scipy / joblib -> services/recommendation-engine/
+#       tensorflow / torch        -> services/recommendation-engine/
+#       motor / pymongo / dnspython -> services/product-service/
+#       apscheduler               -> services/inventory-service/
+#    Adding any of the above broadens the User Service's responsibility
+#    surface in violation of AAP R-30 (events are owned by the producing
+#    domain) and AAP architectural separation between services.
+#
+# 10. uvloop on Windows:
+#     uvloop has no Windows wheel. The pin
+#     `uvloop~=0.19; sys_platform != "win32"` skips installation on
+#     Windows developer machines, where the default asyncio event loop
+#     is used. Production containers are Linux-based and always install
+#     uvloop for the throughput boost.
+# =============================================================================
