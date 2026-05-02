@@ -1,0 +1,207 @@
+# =============================================================================
+# Inventory Service — Default Runtime Configuration
+# =============================================================================
+# Authoritative defaults for every runtime setting consumed by the FastAPI app.
+# Loaded at startup via pydantic_settings.YamlConfigSettingsSource; environment
+# variables declared in ../.env.example override these defaults at the Pydantic
+# settings layer. NEVER add secrets here — DB credentials, JWT signing keys,
+# OAuth/Schema Registry credentials must come exclusively from environment
+# variables sourced from Kubernetes Secrets / Vault (AAP R-25).
+#
+# Cross-references:
+#   - AAP Section 0.5.2.5 Group 5 — per-service default configuration
+#   - AAP Section 0.6.1            — services/*/config/**/*.yaml in scope
+#   - AAP R-25                     — secrets MUST come from env, not files
+#   - AAP R-26                     — structured JSON logs (see ./log_config.json)
+#   - ../.env.example              — env variable catalogue (groups A–K)
+#   - ./log_config.json            — Python logging dictConfig (uvicorn --log-config)
+#   - ../Dockerfile                — mounts this file at /app/config/default.yaml
+#
+# Conventions:
+#   - All time durations use _ms (milliseconds) or _seconds (seconds) suffix
+#   - All keys use snake_case
+#   - 2-space indentation
+#   - Each leaf key is annotated with the env var that overrides it
+#   - "" (empty string) on credential-style keys means "must be supplied via env"
+# =============================================================================
+
+# --- Group A: Service Runtime ------------------------------------------------
+service:
+  name: inventory-service                      # env: SERVICE_NAME
+  port: 8000                                   # env: SERVICE_PORT
+  environment: local                           # env: SERVICE_ENV     (local | dev | staging | prod)
+  graceful_shutdown_timeout_seconds: 30        # env: GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS
+
+logging:
+  level: INFO                                  # env: LOG_LEVEL       (DEBUG | INFO | WARNING | ERROR)
+  format: json                                 # env: LOG_FORMAT      (json | text — json mandated by AAP R-26)
+
+health:
+  liveness_path: /health/live                  # env: HEALTH_LIVENESS_PATH   (AAP R-19)
+  readiness_path: /health/ready                # env: HEALTH_READINESS_PATH  (AAP R-19)
+
+metrics:
+  port: 9090                                   # env: METRICS_PORT
+  path: /metrics                               # env: METRICS_PATH
+
+# --- Group B: PostgreSQL (inventory_db) -------------------------------------
+# NO credentials here per AAP R-25.
+# POSTGRES_USER, POSTGRES_PASSWORD, and the assembled POSTGRES_URL are sourced
+# exclusively from environment variables (Kubernetes Secrets / Vault).
+database:
+  host: localhost                              # env: POSTGRES_HOST
+  port: 5432                                   # env: POSTGRES_PORT
+  name: inventory_db                           # env: POSTGRES_DB
+  ssl_mode: prefer                             # env: POSTGRES_SSL_MODE      (disable | prefer | require | verify-ca | verify-full)
+  pool_min: 2                                  # env: POSTGRES_POOL_MIN
+  pool_max: 20                                 # env: POSTGRES_POOL_MAX
+  pool_timeout_ms: 5000                        # env: POSTGRES_POOL_TIMEOUT_MS
+  statement_timeout_ms: 5000                   # env: POSTGRES_STATEMENT_TIMEOUT_MS
+  lock_timeout_ms: 2000                        # env: POSTGRES_LOCK_TIMEOUT_MS
+  idle_in_transaction_timeout_ms: 10000        # env: POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS
+  application_name: inventory-service          # env: POSTGRES_APPLICATION_NAME
+
+# --- Group C: Kafka (event backbone) ----------------------------------------
+# NO Kafka SASL credentials here per AAP R-25; SASL is enabled by setting
+# KAFKA_SECURITY_PROTOCOL and supplying KAFKA_SASL_USERNAME/PASSWORD via env.
+kafka:
+  bootstrap: localhost:9092                    # env: KAFKA_BOOTSTRAP
+  client_id: inventory-service                 # env: KAFKA_CLIENT_ID
+  group_id: inventory-service                  # env: KAFKA_GROUP_ID
+  security_protocol: PLAINTEXT                 # env: KAFKA_SECURITY_PROTOCOL  (PLAINTEXT | SASL_PLAINTEXT | SSL | SASL_SSL)
+  auto_offset_reset: earliest                  # env: KAFKA_AUTO_OFFSET_RESET  (earliest | latest | none)
+  enable_auto_commit: false                    # env: KAFKA_ENABLE_AUTO_COMMIT  (manual commit only — critical for at-least-once semantics)
+  max_poll_interval_ms: 300000                 # env: KAFKA_MAX_POLL_INTERVAL_MS
+  session_timeout_ms: 45000                    # env: KAFKA_SESSION_TIMEOUT_MS
+  max_poll_records: 100                        # env: KAFKA_MAX_POLL_RECORDS
+  producer:
+    acks: all                                  # env: KAFKA_PRODUCER_ACKS                  (all = wait for ISR replicas)
+    enable_idempotence: true                   # env: KAFKA_PRODUCER_ENABLE_IDEMPOTENCE    (exactly-once producer semantics)
+    compression_type: zstd                     # env: KAFKA_PRODUCER_COMPRESSION_TYPE      (none | gzip | snappy | lz4 | zstd)
+    linger_ms: 10                              # env: KAFKA_PRODUCER_LINGER_MS
+    batch_size: 65536                          # env: KAFKA_PRODUCER_BATCH_SIZE            (bytes)
+    delivery_timeout_ms: 120000                # env: KAFKA_PRODUCER_DELIVERY_TIMEOUT_MS
+    request_timeout_ms: 30000                  # env: KAFKA_PRODUCER_REQUEST_TIMEOUT_MS
+  retry:
+    # AAP R-17: Kafka consumers must support retry topics and dead-letter topics.
+    topic_suffix: .retry                       # env: KAFKA_RETRY_TOPIC_SUFFIX             (e.g., order.created.retry)
+    dlq_topic_suffix: .dlq                     # env: KAFKA_DLQ_TOPIC_SUFFIX               (e.g., order.created.dlq)
+    max_attempts: 5                            # env: KAFKA_RETRY_MAX_ATTEMPTS
+    backoff_initial_ms: 500                    # env: KAFKA_RETRY_BACKOFF_INITIAL_MS
+    backoff_max_ms: 30000                      # env: KAFKA_RETRY_BACKOFF_MAX_MS
+    backoff_multiplier: 2.0                    # env: KAFKA_RETRY_BACKOFF_MULTIPLIER
+    jitter_ms: 250                             # env: KAFKA_RETRY_JITTER_MS
+
+# --- Group D: Schema Registry -----------------------------------------------
+# NO Schema Registry auth credentials here per AAP R-25; supplied via
+# SCHEMA_REGISTRY_AUTH_USERNAME / SCHEMA_REGISTRY_AUTH_PASSWORD env vars.
+schema_registry:
+  url: http://localhost:8081                   # env: SCHEMA_REGISTRY_URL
+  cache_capacity: 1000                         # env: SCHEMA_REGISTRY_CACHE_CAPACITY  (max cached schema IDs in memory)
+
+# --- Group E: Kafka Topic Names (AAP R-30: <domain>.<verb>) -----------------
+# Topic names are domain-owned; producers/consumers reference these keys via
+# the Pydantic settings model rather than literal strings to avoid drift.
+topics:
+  consumed:
+    order_created: order.created               # env: KAFKA_TOPIC_ORDER_CREATED       (saga step: reserve inventory)
+    order_cancelled: order.cancelled           # env: KAFKA_TOPIC_ORDER_CANCELLED     (saga step: release reservation)
+    order_fulfilled: order.fulfilled           # env: KAFKA_TOPIC_ORDER_FULFILLED     (saga step: convert reservation → commitment)
+  produced:
+    inventory_reserved: inventory.reserved             # env: KAFKA_TOPIC_INVENTORY_RESERVED
+    inventory_reservation_failed: inventory.reservation_failed  # env: KAFKA_TOPIC_INVENTORY_RESERVATION_FAILED
+    inventory_released: inventory.released             # env: KAFKA_TOPIC_INVENTORY_RELEASED
+    inventory_low_stock: inventory.low-stock           # env: KAFKA_TOPIC_INVENTORY_LOW_STOCK  (note: hyphenated suffix per AAP topic catalog)
+  dlq:
+    inventory_dlq: inventory.dlq                       # env: KAFKA_TOPIC_INVENTORY_DLQ        (terminal poison-message destination)
+
+# --- Group F: Reservation & Stock Policy ------------------------------------
+# Inventory-domain knobs that govern the stock reservation lifecycle.
+reservation:
+  low_stock_threshold_default: 10              # env: LOW_STOCK_THRESHOLD_DEFAULT          (per-SKU floor; emit inventory.low-stock when on-hand falls below)
+  expiry_ms: 900000                            # env: RESERVATION_EXPIRY_MS                (15 minutes — fallback for stuck sagas, AAP R-20)
+  expiry_scheduler_poll_interval_ms: 60000     # env: RESERVATION_EXPIRY_SCHEDULER_POLL_INTERVAL_MS  (60s — release stuck reservations promptly without excess DB scan load)
+  expiry_scheduler_batch_size: 200             # env: RESERVATION_EXPIRY_SCHEDULER_BATCH_SIZE        (max reservations released per scheduler tick)
+  optimistic_lock:
+    # stock_items.version optimistic locking with bounded retry + jittered exponential backoff.
+    max_retries: 5                             # env: STOCK_OPTIMISTIC_LOCK_MAX_RETRIES
+    backoff_initial_ms: 25                     # env: STOCK_OPTIMISTIC_LOCK_BACKOFF_INITIAL_MS
+    backoff_max_ms: 500                        # env: STOCK_OPTIMISTIC_LOCK_BACKOFF_MAX_MS
+    jitter_ms: 10                              # env: STOCK_OPTIMISTIC_LOCK_JITTER_MS
+  default_warehouse_adapter: database          # env: DEFAULT_WAREHOUSE_ADAPTER  (database | external_wms — plug-in adapter selection per AAP R-20)
+
+# --- Group G: HTTP Client Resilience (AAP R-15 / R-16) ----------------------
+# Applies to all outbound HTTP calls (e.g., admin-only product-service lookups,
+# webhook callbacks). Every call must have a timeout, retry policy, and circuit
+# breaker in front of it.
+http_client:
+  connect_timeout_ms: 2000                     # env: HTTP_CLIENT_CONNECT_TIMEOUT_MS
+  read_timeout_ms: 5000                        # env: HTTP_CLIENT_READ_TIMEOUT_MS
+  total_timeout_ms: 10000                      # env: HTTP_CLIENT_TOTAL_TIMEOUT_MS
+  max_retries: 3                               # env: HTTP_CLIENT_MAX_RETRIES
+  backoff_initial_ms: 100                      # env: HTTP_CLIENT_BACKOFF_INITIAL_MS
+  backoff_max_ms: 2000                         # env: HTTP_CLIENT_BACKOFF_MAX_MS
+  backoff_multiplier: 2.0                      # env: HTTP_CLIENT_BACKOFF_MULTIPLIER
+  backoff_jitter_ms: 50                        # env: HTTP_CLIENT_BACKOFF_JITTER_MS
+  circuit_breaker:
+    failure_threshold: 5                       # env: CIRCUIT_BREAKER_FAILURE_THRESHOLD     (consecutive failures before opening)
+    reset_timeout_ms: 30000                    # env: CIRCUIT_BREAKER_RESET_TIMEOUT_MS      (wait before half-open probe)
+    half_open_max_calls: 3                     # env: CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS   (probe call budget)
+
+# --- Group H: JWT / OAuth (AAP R-21 / R-22 / R-23) --------------------------
+# Auth Service is the SOLE issuer of JWTs; this service only validates them.
+# JWKS is fetched lazily and cached with a bounded TTL (AAP R-22).
+auth:
+  audience: inventory-service                  # env: JWT_AUDIENCE                    (must match the `aud` claim issued by Auth Service)
+  issuer: https://auth.example.com             # env: JWT_ISSUER                       (must match the `iss` claim)
+  public_key_url: https://auth.example.com/.well-known/jwks.json   # env: JWT_PUBLIC_KEY_URL  (JWKS endpoint per AAP R-22)
+  jwks_cache_ttl_seconds: 3600                 # env: JWT_JWKS_CACHE_TTL_SECONDS       (1 hour — bounded per AAP R-22)
+  leeway_seconds: 30                           # env: JWT_LEEWAY_SECONDS               (clock-skew tolerance on exp/nbf)
+  required_scope_admin: inventory:admin        # env: JWT_REQUIRED_SCOPE_ADMIN         (writes: warehouses, manual stock moves, threshold tuning)
+  required_scope_read: inventory:read          # env: JWT_REQUIRED_SCOPE_READ          (reads: stock levels, reservation history)
+
+# --- Group I: Observability -------------------------------------------------
+# Logging, tracing, and metrics knobs. Structured-logging FORMAT is configured
+# in ./log_config.json (AAP R-26); these knobs control middleware behavior.
+observability:
+  correlation_id_header: X-Correlation-ID      # env: CORRELATION_ID_HEADER            (AAP R-13)
+  correlation_id_required: false               # env: CORRELATION_ID_REQUIRED          (false = generate one if missing; true = 400 Bad Request when absent)
+  log_include_request_body: false              # env: LOG_INCLUDE_REQUEST_BODY         (PII / size-blowup risk — keep false in non-debug envs)
+  log_include_response_body: false             # env: LOG_INCLUDE_RESPONSE_BODY        (size-blowup risk — keep false in non-debug envs)
+  log_redact_fields:                           # env: LOG_REDACT_FIELDS  (comma-separated env override; case-insensitive match)
+    - password
+    - token
+    - secret
+    - authorization
+    - cookie
+    - api_key
+    - apikey
+  otel:
+    service_name: inventory-service            # env: OTEL_SERVICE_NAME
+    exporter_otlp_endpoint: ""                 # env: OTEL_EXPORTER_OTLP_ENDPOINT      (empty string = OTel disabled in local dev; supply OTLP collector URL in cluster envs)
+    exporter_otlp_insecure: true               # env: OTEL_EXPORTER_OTLP_INSECURE      (true for in-cluster gRPC; false for TLS endpoints)
+    traces_sampler: parentbased_traceidratio   # env: OTEL_TRACES_SAMPLER              (head-based sampler honoring upstream sampling decision)
+    traces_sampler_arg: 0.10                   # env: OTEL_TRACES_SAMPLER_ARG          (10% sample rate for new traces)
+    resource_attributes: service.name=inventory-service,service.namespace=ecommerce  # env: OTEL_RESOURCE_ATTRIBUTES
+  prometheus_multiproc_dir: /app/tmp/prometheus  # env: PROMETHEUS_MULTIPROC_DIR        (required when running uvicorn with multiple worker processes)
+
+# --- Group J: Feature Flags -------------------------------------------------
+# Per-environment toggles. All defaults are TRUE (production-safe).
+# Tests use freezegun to control time; setting reservation_expiry_scheduler_enabled=false
+# under tests prevents the background scheduler from interfering.
+features:
+  reservation_expiry_scheduler_enabled: true   # env: FEATURE_RESERVATION_EXPIRY_SCHEDULER_ENABLED  (AAP R-20 — saga fallback path)
+  low_stock_events_enabled: true               # env: FEATURE_LOW_STOCK_EVENTS_ENABLED              (emit inventory.low-stock to Kafka)
+  stock_movement_audit_enabled: true           # env: FEATURE_STOCK_MOVEMENT_AUDIT_ENABLED          (write to stock_movements table on every change)
+  admin_endpoints_enabled: true                # env: FEATURE_ADMIN_ENDPOINTS_ENABLED               (mount /admin/* routes)
+
+# --- Group K: Migrations ----------------------------------------------------
+migrations:
+  run_on_startup: true                         # env: RUN_MIGRATIONS_ON_STARTUP        (Alembic upgrade head before serving traffic)
+  dir: migrations                              # env: MIGRATIONS_DIR                   (path relative to /app inside the container)
+
+# =============================================================================
+# End of default.yaml. Override any value via the corresponding env var listed
+# above. NEVER add secrets to this file; use Kubernetes Secrets / Vault and
+# inject via env vars at deploy time (AAP R-25).
+# =============================================================================
