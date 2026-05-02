@@ -1,0 +1,104 @@
+[
+  {
+    "_id": "apparel",
+    "depth": 0,
+    "description": "Clothing, footwear, and accessories for every season.",
+    "display_order": 10,
+    "metadata": {
+      "i18n_key": "category.apparel.name",
+      "icon": "shirt"
+    },
+    "name": "Apparel",
+    "parent_id": null,
+    "path": [
+      "apparel"
+    ],
+    "slug": "apparel",
+    "status": "active"
+  },
+  {
+    "_id": "electronics",
+    "depth": 0,
+    "description": "Phones, computers, audio gear, and smart-home devices.",
+    "display_order": 20,
+    "metadata": {
+      "i18n_key": "category.electronics.name",
+      "icon": "cpu"
+    },
+    "name": "Electronics",
+    "parent_id": null,
+    "path": [
+      "electronics"
+    ],
+    "slug": "electronics",
+    "status": "active"
+  },
+  {
+    "_id": "home",
+    "depth": 0,
+    "description": "Furniture, decor, kitchenware, and household essentials.",
+    "display_order": 30,
+    "metadata": {
+      "i18n_key": "category.home.name",
+      "icon": "home"
+    },
+    "name": "Home",
+    "parent_id": null,
+    "path": [
+      "home"
+    ],
+    "slug": "home",
+    "status": "active"
+  },
+  {
+    "_id": "groceries",
+    "depth": 0,
+    "description": "Pantry staples, fresh produce, beverages, and snacks.",
+    "display_order": 40,
+    "metadata": {
+      "i18n_key": "category.groceries.name",
+      "icon": "shopping-basket"
+    },
+    "name": "Groceries",
+    "parent_id": null,
+    "path": [
+      "groceries"
+    ],
+    "slug": "groceries",
+    "status": "active"
+  },
+  {
+    "_id": "beauty",
+    "depth": 0,
+    "description": "Skincare, makeup, fragrance, and personal care.",
+    "display_order": 50,
+    "metadata": {
+      "i18n_key": "category.beauty.name",
+      "icon": "sparkles"
+    },
+    "name": "Beauty",
+    "parent_id": null,
+    "path": [
+      "beauty"
+    ],
+    "slug": "beauty",
+    "status": "active"
+  },
+  {
+    "_id": "books",
+    "depth": 0,
+    "description": "Books, e-readers, and educational media.",
+    "display_order": 60,
+    "metadata": {
+      "i18n_key": "category.books.name",
+      "icon": "book-open"
+    },
+    "name": "Books",
+    "parent_id": null,
+    "path": [
+      "books"
+    ],
+    "slug": "books",
+    "status": "active"
+  }
+]
