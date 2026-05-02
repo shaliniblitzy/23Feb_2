@@ -1,0 +1,73 @@
+{
+  "bsonType": "object",
+  "required": [
+    "_id",
+    "product_id",
+    "cdn_url",
+    "kind",
+    "sort_order",
+    "created_at"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "_id": {
+      "bsonType": ["objectId", "string"],
+      "description": "MongoDB document identifier. Accepts ObjectId (driver default) or string (for deterministic ids if needed). Matches the bsonType of `products._id` for cross-collection consistency."
+    },
+    "alt_text": {
+      "bsonType": "string",
+      "maxLength": 1024,
+      "description": "Alternative text for accessibility (WCAG 2.1) and SEO. Required for images on the storefront UI but not enforced by this validator because some media kinds (e.g., `document`) may not need it. Application-layer Pydantic models in `../../src/` enforce presence for `kind=image`."
+    },
+    "cdn_url": {
+      "bsonType": "string",
+      "minLength": 1,
+      "maxLength": 2048,
+      "pattern": "^https?://[^\\s]+$",
+      "description": "URL of the CDN-hosted asset (image, video, or document). Must be a non-empty HTTP(S) URL. The asset bytes themselves live on the CDN; this collection stores ONLY the metadata. The 2048-character upper bound matches common URL-length limits across CDNs and HTTP intermediaries. The pattern is intentionally lenient (no full RFC 3986 parse) — the application layer performs richer URL validation via Pydantic's `HttpUrl` type. Both `http://` and `https://` are permitted; production should use HTTPS (AAP R-24) but local dev against MinIO / fake CDNs may use HTTP."
+    },
+    "created_at": {
+      "bsonType": "date",
+      "description": "UTC timestamp when the media reference was registered. Stored as MongoDB BSON date (millisecond precision). Immutable post-create."
+    },
+    "height": {
+      "bsonType": ["int", "long"],
+      "minimum": 1,
+      "description": "Pixel height for image/video; absent for documents. Application validation enforces presence for `kind=image|video` once the asynchronous inspection job populates dimensions."
+    },
+    "kind": {
+      "enum": ["image", "video", "document"],
+      "description": "Media classification driving rendering and storage behavior. 'image' = static image (jpg/png/webp); 'video' = video file (mp4/webm); 'document' = downloadable resource (pdf/spec sheet). These values match the application's `MediaKind` StrEnum in `../../src/domain/models.py` — kept in sync via code review per parent folder spec."
+    },
+    "metadata": {
+      "bsonType": "object",
+      "description": "Free-form metadata bag for kind-specific attributes (e.g., mime_type, file_size_bytes, duration_seconds, codec, color_profile, transcoding_status, signed_url_expires_at). Application-layer Pydantic models constrain shape per kind. The lack of `properties` keys here is intentional (AAP R-7 — flexible schema); `additionalProperties: true` at the document root permits this bag to grow without validator churn."
+    },
+    "mime_type": {
+      "bsonType": "string",
+      "minLength": 3,
+      "maxLength": 255,
+      "pattern": "^[a-zA-Z0-9!#$&^_+.\\-]+/[a-zA-Z0-9!#$&^_+.\\-]+$",
+      "description": "RFC 6838 media type (e.g., 'image/jpeg', 'video/mp4', 'application/pdf'). Optional; absent if not yet inspected by the upload pipeline. The pattern approximates the RFC 6838 grammar — strict enough to reject obvious garbage, lenient enough to accept vendor-prefixed types (e.g., 'application/vnd.api+json')."
+    },
+    "product_id": {
+      "bsonType": ["objectId", "string"],
+      "description": "Reference to the owning product (`products._id`). Foreign-key-ish reference to a peer document in the same `product_db` (NOT cross-service per AAP R-6). Backed by the `idx_product_media__product_sort` compound index for fast media-listing queries. NOT nullable — every media document MUST belong to a product; orphan media is a bug."
+    },
+    "sort_order": {
+      "bsonType": ["int", "long"],
+      "minimum": 0,
+      "maximum": 100000,
+      "description": "Display order within the product's media list. Lower values appear first. Capped at 100000 to bound list-merge cost; larger values are pathological for storefront UX and are rejected by the application's bulk-reorder API at the same threshold. Backed by the `idx_product_media__product_sort` compound index."
+    },
+    "updated_at": {
+      "bsonType": "date",
+      "description": "UTC timestamp of the most recent update (e.g., when alt_text was changed or transcoding metadata was populated)."
+    },
+    "width": {
+      "bsonType": ["int", "long"],
+      "minimum": 1,
+      "description": "Pixel width for image/video; absent for documents. Application validation enforces presence for `kind=image|video` once the asynchronous inspection job populates dimensions."
+    }
+  }
+}
