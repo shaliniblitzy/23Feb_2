@@ -1,0 +1,80 @@
+{
+  "bsonType": "object",
+  "required": [
+    "_id",
+    "slug",
+    "name",
+    "parent_id",
+    "depth",
+    "path",
+    "status"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "_id": {
+      "bsonType": ["objectId", "string"],
+      "description": "MongoDB document identifier. Accepts ObjectId (driver default) or string (for deterministic ids derived from slug, e.g., UUIDv5)."
+    },
+    "created_at": {
+      "bsonType": "date",
+      "description": "UTC timestamp when the category was created. Stored as MongoDB BSON date (millisecond precision)."
+    },
+    "depth": {
+      "bsonType": ["int", "long"],
+      "minimum": 0,
+      "maximum": 16,
+      "description": "Tree depth from the root. 0 for root categories (parent_id=null). Capped at 16 to bound traversal cost; deeper trees are pathological for storefront UX."
+    },
+    "description": {
+      "bsonType": "string",
+      "maxLength": 4096,
+      "description": "Optional long-form category description for SEO / landing pages."
+    },
+    "display_order": {
+      "bsonType": ["int", "long"],
+      "minimum": 0,
+      "description": "Sort order within the same parent. Lower values appear first."
+    },
+    "metadata": {
+      "bsonType": "object",
+      "description": "Free-form metadata bag for category-specific attributes (banner_image_url, theme_color, featured_brands, etc.). Application-level Pydantic models constrain this further."
+    },
+    "name": {
+      "bsonType": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Human-readable category name (e.g., 'Apparel', 'Mobile Phones'). Multi-language support is provided via metadata.localized_names; this field is the canonical English name."
+    },
+    "parent_id": {
+      "bsonType": ["objectId", "string", "null"],
+      "description": "Parent category id. NULL for root categories. Foreign-key-ish reference to a peer document in the same `categories` collection (NOT cross-service per AAP R-6)."
+    },
+    "path": {
+      "bsonType": "array",
+      "minItems": 1,
+      "maxItems": 17,
+      "items": {
+        "bsonType": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+      },
+      "description": "Materialized path: array of slugs from root to this category, INCLUDING this category's own slug as the last element. For a root category, path = [own_slug]. For a depth-1 child, path = [root_slug, own_slug]. Enables fast ancestor queries via the `idx_categories__path` multikey index. maxItems=17 = depth max (16) + 1 to include the leaf itself."
+    },
+    "slug": {
+      "bsonType": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "description": "URL-safe slug (lowercase alphanumeric with single-hyphen separators). UNIQUE across all categories — enforced by the `idx_categories__slug` index. The pattern rejects empty segments, leading/trailing hyphens, and uppercase characters."
+    },
+    "status": {
+      "enum": ["draft", "active", "archived"],
+      "description": "Lifecycle state. 'draft' = not yet visible to storefront; 'active' = visible and selectable; 'archived' = soft-deleted (kept for historical product references but hidden from category listings)."
+    },
+    "updated_at": {
+      "bsonType": "date",
+      "description": "UTC timestamp of the most recent update. Stored as MongoDB BSON date."
+    }
+  }
+}
