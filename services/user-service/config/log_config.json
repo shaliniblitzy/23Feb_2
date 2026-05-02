@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "disable_existing_loggers": false,
+  "formatters": {
+    "json": {
+      "()": "pythonjsonlogger.jsonlogger.JsonFormatter",
+      "format": "%(asctime)s %(levelname)s %(name)s %(correlation_id)s %(user_id)s %(route)s %(method)s %(status_code)s %(latency_ms)s %(event_type)s %(message)s",
+      "rename_fields": {
+        "asctime": "timestamp",
+        "levelname": "level",
+        "name": "service"
+      },
+      "datefmt": "%Y-%m-%dT%H:%M:%S%z"
+    }
+  },
+  "handlers": {
+    "default": {
+      "class": "logging.StreamHandler",
+      "stream": "ext://sys.stdout",
+      "formatter": "json",
+      "level": "INFO"
+    }
+  },
+  "loggers": {
+    "uvicorn": {
+      "handlers": ["default"],
+      "level": "INFO",
+      "propagate": false
+    },
+    "uvicorn.error": {
+      "handlers": ["default"],
+      "level": "INFO",
+      "propagate": false
+    },
+    "uvicorn.access": {
+      "handlers": ["default"],
+      "level": "INFO",
+      "propagate": false
+    },
+    "gunicorn": {
+      "handlers": ["default"],
+      "level": "INFO",
+      "propagate": false
+    },
+    "fastapi": {
+      "handlers": ["default"],
+      "level": "INFO",
+      "propagate": false
+    },
+    "sqlalchemy.engine": {
+      "handlers": ["default"],
+      "level": "INFO",
+      "propagate": false
+    },
+    "confluent_kafka": {
+      "handlers": ["default"],
+      "level": "INFO",
+      "propagate": false
+    }
+  },
+  "root": {
+    "handlers": ["default"],
+    "level": "INFO"
+  }
+}
