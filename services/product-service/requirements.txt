@@ -1,0 +1,409 @@
+# =============================================================================
+# Product Service — Python Dependencies
+# =============================================================================
+# Target runtime  : Python 3.11+
+# Service domain  : Product catalog, category tree, and product-media
+#                   metadata management for the e-commerce platform. Owns
+#                   product_db (MongoDB) per AAP Rule R-7 (polyglot
+#                   persistence — flexible schema for varying per-category
+#                   product attributes); produces product.created /
+#                   product.updated events to Kafka per AAP Section 0.4.2 /
+#                   R-30 for downstream consumption by Recommendation
+#                   Engine and Inventory Service. The service exposes
+#                   synchronous read endpoints behind the API Gateway
+#                   (`Gateway -->|REST /products| ProductSvc`) and admin
+#                   write endpoints for catalog curation.
+# Source of truth : Agent Action Plan (AAP) Section 0.3.1 (public packages),
+#                   Section 0.3.3 (dependency updates), Section 0.4.2
+#                   (Kafka producer + downstream consumers + correlation-ID
+#                   propagation), Section 0.4.4 (product_db MongoDB
+#                   collections: products, categories, product_media), and
+#                   applicable rules R-6 (database-per-service), R-7
+#                   (polyglot persistence — MongoDB for flexible product
+#                   schema), R-13 (correlation-ID propagation), R-14 (Schema
+#                   Registry), R-15 (retry with exponential backoff +
+#                   jitter), R-16 (circuit breaker), R-17 (DLQ / retry
+#                   topics), R-19 (liveness / readiness probes), R-21 /
+#                   R-22 (JWT validation with bounded TTL JWKS cache),
+#                   R-26 / R-27 (structured JSON logs shipped via Beats to
+#                   Logstash), R-30 (event naming conventions:
+#                   <domain>.<verb>).
+#
+# Pinning policy  : Every package carries a lower bound (>=) and an upper
+#                   bound (<) excluding the next major version. This permits
+#                   safe patch / minor upgrades while preventing breaking
+#                   major-version drift. No package is left bare; no `==`
+#                   pinning is used unless accompanied by a "# pin: <reason>"
+#                   comment. Style mirrors sibling Python services
+#                   (notification-service, payment-service,
+#                   recommendation-engine) for monorepo cognitive
+#                   consistency.
+#
+# Subtractive    : This service deliberately omits dependencies that live
+# scope            in sibling services or do not apply to a MongoDB-backed
+#                   catalog. Per AAP architectural rules:
+#                     - NO psycopg / sqlalchemy / alembic  -> relational
+#                       siblings (auth, user, inventory, order, payment,
+#                       notification). MongoDB index management lives in
+#                       `services/product-service/migrations/` and is
+#                       executed via the sync `pymongo` driver.
+#                     - NO stripe / razorpay -> payment-service domain
+#                     - NO twilio / sendgrid / boto3 SES|SNS / jinja2 ->
+#                       notification-service domain
+#                     - NO redis / pgvector / scikit-learn / numpy / scipy
+#                       / tensorflow / torch -> recommendation-engine
+#                       domain. Category-tree caching is realized in
+#                       process via `cachetools` (already installed for
+#                       JWKS bounded-TTL caching).
+#                     - NO email-validator -> not part of the catalog
+#                       domain (notification-service consumes events with
+#                       email fields).
+#                     - NO opentelemetry-instrumentation-sqlalchemy ->
+#                       replaced by opentelemetry-instrumentation-pymongo
+#                       for MongoDB span instrumentation.
+#                     - NO testcontainers[postgres] -> replaced by
+#                       testcontainers[mongodb] for integration tests.
+#
+# Install         : python -m pip install -r requirements.txt
+# Compile wheels  : pip wheel -r requirements.txt -w /tmp/wheels
+# Audit CVEs      : pip-audit -r requirements.txt
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Web Framework & ASGI Server
+# -----------------------------------------------------------------------------
+# FastAPI exposes the synchronous catalog endpoints — GET /products
+# (paginated catalog query), GET /products/{id} (single product lookup
+# with category + media), POST /products (admin create), PUT /products/{id}
+# (admin update), DELETE /products/{id} (admin soft-delete), GET
+# /categories (full category tree), POST /categories (admin create),
+# GET /health/live, GET /health/ready, GET /metrics — fronted by the API
+# Gateway per AAP Section 0.5.1 (Mermaid edge: `Gateway -->|REST /products|
+# ProductSvc`). FastAPI auto-generates the OpenAPI document referenced by
+# the Gateway and `docs/api/*` per AAP Section 0.3.1 (OpenAPI tooling).
+# uvicorn[standard] adds uvloop + httptools for production throughput;
+# the Dockerfile CMD runs `uvicorn ... --loop uvloop --http httptools`.
+# Pydantic v2 powers request/response validation AND validates the Kafka
+# event payloads emitted by the catalog write path (product.created,
+# product.updated). pydantic-settings drives 12-factor environment-
+# variable configuration loading and fails fast on missing required
+# variables per AAP R-19. starlette is the underlying ASGI substrate of
+# FastAPI and is pinned explicitly so security patches resolve
+# deterministically.
+# -----------------------------------------------------------------------------
+fastapi>=0.110.0,<1.0.0                                    # AAP Section 0.3.1 — OpenAPI tooling / sync HTTP entrypoints
+pydantic>=2.6.0,<3.0.0                                     # Request / response model validation (FastAPI v2 stack)
+pydantic-settings>=2.2.0,<3.0.0                            # 12-factor env-var configuration loader
+starlette>=0.37.0,<1.0.0                                   # FastAPI substrate (pinned for deterministic resolution)
+uvicorn[standard]>=0.29.0,<1.0.0                           # ASGI server (Dockerfile CMD); [standard] -> uvloop + httptools
+
+
+# -----------------------------------------------------------------------------
+# Kafka — Event Streaming Backbone
+# -----------------------------------------------------------------------------
+# confluent-kafka wraps librdkafka for high-throughput produce; the
+# [avro,schemaregistry,json] extras stream events through Schema Registry
+# per AAP R-14 to enforce backward-compatible schema evolution. fastavro
+# is the compiled Avro serializer used by the Schema Registry Avro
+# encoder. The Product Service is a PRODUCER of `product.created` and
+# `product.updated` events (AAP Section 0.4.2 / R-30) consumed by the
+# Recommendation Engine (embedding refresh) and Inventory Service
+# (catalog reconciliation). Producer-side delivery failures route through
+# the standard `<topic>.retry` / `<topic>.dlq` pattern realized in
+# src/messaging/ per AAP R-17. Sibling services (payment-service,
+# notification-service, recommendation-engine, order-service,
+# inventory-service) use the same client to share operational tooling
+# and monitoring dashboards (AAP Section 0.3.1 — confluent-kafka).
+# -----------------------------------------------------------------------------
+confluent-kafka[avro,schemaregistry,json]>=2.3.0,<3.0.0    # AAP R-14 (Schema Registry) + R-17 (retry/DLQ) + R-30 (event naming)
+fastavro>=1.9.0,<2.0.0                                     # Avro serialization for Schema Registry-encoded events
+
+
+# -----------------------------------------------------------------------------
+# Database — MongoDB (product_db) — AAP R-7, Section 0.4.4
+# -----------------------------------------------------------------------------
+# The Product Service owns its own data store per AAP Rule R-6 (database-
+# per-service). The store is MongoDB with three collections — `products`,
+# `categories`, `product_media` — per AAP Section 0.4.4. MongoDB is
+# chosen over PostgreSQL specifically for AAP R-7 (polyglot persistence):
+# product attributes vary widely by category (apparel sizes vs.
+# electronics specs vs. grocery weights) and the document model
+# eliminates schema-migration churn that would otherwise plague a
+# relational design.
+#
+# Both async (`motor`) and sync (`pymongo`) drivers are installed by
+# design:
+#   - motor (async, asyncio-native) is used by FastAPI request handlers
+#     for non-blocking reads/writes — see src/repository/.
+#   - pymongo (sync) is used directly by the migration scripts under
+#     `migrations/` which run synchronously during container startup
+#     before the ASGI event loop is up; index creation, text-search index
+#     compilation, and seed-data loading benefit from the simpler sync
+#     API. motor declares pymongo as a hard dependency so it would be
+#     installed transitively anyway, but pinning it explicitly makes the
+#     dual usage auditable and prevents unintended major-version drift.
+#
+# dnspython is required by pymongo to resolve `mongodb+srv://` SRV
+# records used by MongoDB Atlas and by replica-set discovery in self-
+# hosted clusters. pymongo declares dnspython as an optional dependency
+# only enabled by the `srv` extra; we install it unconditionally so
+# every deployment can use SRV connection strings without rebuilding
+# the image.
+# -----------------------------------------------------------------------------
+dnspython>=2.6.0,<3.0.0                                    # AAP Section 0.4.4 — mongodb+srv:// SRV-record resolution (Atlas / replica-sets)
+motor>=3.4.0,<4.0.0                                        # AAP R-7 — async MongoDB driver for FastAPI non-blocking I/O
+pymongo>=4.6.0,<5.0.0                                      # AAP R-7 — sync driver (motor dependency + sync migration scripts)
+
+
+
+# -----------------------------------------------------------------------------
+# HTTP Client — Outbound JWKS Fetch + Future Integrations
+# -----------------------------------------------------------------------------
+# httpx is the async-first HTTP client used to fetch the Auth Service
+# JWKS endpoint (AAP R-22) for JWT signature verification, and to call
+# the Schema Registry HTTP API when not using confluent-kafka's bundled
+# transport. The catalog domain has minimal external HTTP surface area
+# compared to payment-service / notification-service — there are no
+# third-party provider SDKs in this manifest — but httpx is included
+# for the JWKS path and to keep the resilience-decorator wiring
+# (`tenacity` + `pybreaker`) consistent across services. It supports
+# per-request timeouts, transport-level retries, HTTP/2, and cleanly
+# integrates with respx for tests.
+# -----------------------------------------------------------------------------
+httpx>=0.27.0,<1.0.0                                       # AAP R-22 — async HTTP client for JWKS fetch + Schema Registry REST calls
+
+
+# -----------------------------------------------------------------------------
+# Resilience — Retry, Backoff, Circuit Breaker
+# -----------------------------------------------------------------------------
+# tenacity provides retry decorators with exponential backoff + jitter,
+# bounded attempts, and configurable predicates per AAP R-15. Retries
+# protect every Kafka produce attempt and every JWKS / Schema Registry
+# HTTP call. pybreaker wraps each outbound call site with a thread-safe
+# in-process circuit breaker (open / half-open / closed) per AAP R-16
+# so a flapping dependency (Kafka broker, Schema Registry, Auth Service
+# JWKS) cannot exhaust the request thread pool. Both libraries are
+# explicitly listed as canonical examples in AAP Section 0.3.1
+# alongside resilience4j and opossum, and they match the resilience
+# stack used by sibling services (payment-service, notification-service,
+# recommendation-engine, order-service, inventory-service) for
+# operational consistency.
+# -----------------------------------------------------------------------------
+pybreaker>=1.2.0,<2.0.0                                    # AAP R-16 — circuit breaker (open / half-open / closed states)
+tenacity>=8.2.3,<9.0.0                                     # AAP R-15 — retry w/ exponential backoff + jitter, bounded attempts
+
+
+# -----------------------------------------------------------------------------
+# Authentication — JWT Validation Only
+# -----------------------------------------------------------------------------
+# Per AAP R-21, the Auth Service is the SOLE issuer of JWT tokens; this
+# service VALIDATES ONLY, never signs. pyjwt[crypto] supports RS256 /
+# ES256 verification using public keys fetched from the Auth Service
+# JWKS endpoint. cachetools provides the bounded-TTL JWKS key cache
+# mandated by AAP R-22 — keys are refreshed automatically without
+# restart, which enables seamless key rotation in the Auth Service. The
+# same `cachetools` package also backs the in-process LRU cache used to
+# memoize the category tree and frequently-accessed product lookups —
+# this avoids introducing a Redis dependency that the catalog domain
+# does not otherwise need (Redis lives in recommendation-engine and is
+# scoped to the rec_cache keyspace per AAP Section 0.4.4).
+# -----------------------------------------------------------------------------
+cachetools>=5.3.0,<6.0.0                                   # AAP R-22 — bounded TTL cache for JWKS keys + in-process category tree LRU
+pyjwt[crypto]>=2.8.0,<3.0.0                                # AAP R-21 / R-22 — JWT validation only (RS256/ES256)
+
+
+# -----------------------------------------------------------------------------
+# Observability — Logs, Metrics, Tracing
+# -----------------------------------------------------------------------------
+# All logs are emitted as structured JSON with the canonical fields per
+# AAP R-26 (timestamp, level, service, correlation_id, user_id, route,
+# method, status, latency_ms, message). Filebeat tails container stdout
+# and ships to Logstash per AAP R-27. Prometheus metrics surface at
+# /metrics for Metricbeat scraping. OpenTelemetry primitives propagate
+# the X-Correlation-ID through HTTP and Kafka headers and through
+# pymongo / motor spans for end-to-end tracing of the
+# query → render → cache → respond and admin write → produce-event
+# flows.
+#
+# CRITICAL: opentelemetry-instrumentation-pymongo replaces
+# opentelemetry-instrumentation-sqlalchemy used by the relational
+# siblings — this is the single most important manifest difference
+# from notification-service / payment-service / order-service /
+# inventory-service. pymongo is the underlying driver for both motor
+# (async) and direct sync usage, so this single instrumentation package
+# captures spans for all database operations in this service.
+# -----------------------------------------------------------------------------
+opentelemetry-api>=1.24.0,<2.0.0                           # OTel tracing API — correlation-ID propagation primitives
+opentelemetry-exporter-otlp>=1.24.0,<2.0.0                 # OTLP exporter for traces / metrics
+opentelemetry-instrumentation-fastapi>=0.45b0,<1.0.0       # Auto-instrument FastAPI request lifecycle (catalog endpoints)
+opentelemetry-instrumentation-httpx>=0.45b0,<1.0.0         # Auto-instrument outbound httpx calls (JWKS / Schema Registry)
+opentelemetry-instrumentation-pymongo>=0.45b0,<1.0.0       # AAP R-26 — distributed tracing for MongoDB operations (motor + pymongo)
+opentelemetry-sdk>=1.24.0,<2.0.0                           # OTel SDK — span processors, exporters
+prometheus-client>=0.20.0,<1.0.0                           # AAP R-27 — /metrics endpoint scraped by Metricbeat
+python-json-logger>=2.0.7,<3.0.0                           # JSON formatter for stdlib logging compatibility
+structlog>=24.1.0,<25.0.0                                  # AAP R-26 — structured JSON log emission
+
+
+
+# -----------------------------------------------------------------------------
+# Catalog Utilities — Slug Generation
+# -----------------------------------------------------------------------------
+# python-slugify is a small but important catalog-domain utility that
+# generates URL-safe ASCII slugs from product and category names. It
+# transliterates Unicode (Cyrillic, CJK, accented Latin, Devanagari,
+# etc.) to ASCII so the slug column on the `products` and `categories`
+# collections renders identically across locales and is safe to use in
+# canonical URLs (`/products/{slug}-{id}`). It is configurable for
+# separators, max length, and stop-word stripping — see
+# src/utils/slug.py for the canonical wiring.
+# -----------------------------------------------------------------------------
+python-slugify>=8.0.4,<9.0.0                               # URL-safe slugs for product / category names (Unicode -> ASCII)
+
+
+# -----------------------------------------------------------------------------
+# Security — Cryptography (CVE patch cadence)
+# -----------------------------------------------------------------------------
+# `cryptography` is transitively installed by `pyjwt[crypto]`; pinning
+# it explicitly here makes CVE-driven version bumps auditable in this
+# single manifest rather than buried in transitive resolution. Matches
+# the pin used by sibling Python services (notification-service,
+# payment-service, recommendation-engine) for monorepo consistency and
+# coordinated CVE response across the fleet.
+# -----------------------------------------------------------------------------
+cryptography>=42.0.0,<43.0.0                               # Pinned for explicit CVE patch cadence (also pulled via pyjwt[crypto])
+
+
+# -----------------------------------------------------------------------------
+# General Utilities
+# -----------------------------------------------------------------------------
+# orjson backs FastAPI's ORJSONResponse for fast response serialization
+# of large product / category payloads. python-dotenv loads `.env` files
+# in local development only — production Kubernetes injects secrets via
+# Secret resources (AAP R-25). pyyaml parses `config/default.yaml`.
+# python-dateutil handles timezone-aware logic for product launch /
+# expiration scheduling and for the `effective_at` / `published_at`
+# fields on the catalog write events.
+# -----------------------------------------------------------------------------
+orjson>=3.9.15,<4.0.0                                      # Fast JSON serialization (FastAPI ORJSONResponse)
+python-dateutil>=2.9.0,<3.0.0                              # Timezone-aware logic for product launch / expiration scheduling
+python-dotenv>=1.0.0,<2.0.0                                # Local-dev .env loader (NOT used in production per AAP R-25)
+pyyaml>=6.0.1,<7.0.0                                       # config/default.yaml parsing
+
+
+# =============================================================================
+# Testing (dev)
+# =============================================================================
+# These dependencies support the pytest-driven unit and integration
+# suites under `services/product-service/tests/`. They are bundled into
+# the main manifest for monorepo simplicity matching sibling services
+# (notification-service, payment-service, recommendation-engine,
+# order-service, inventory-service); a future split into
+# `requirements-dev.txt` is permissible but not required.
+#
+# testcontainers spins up real MongoDB and Kafka containers for
+# integration tests so producer / persistence behavior is exercised
+# against the genuine wire protocol — this is critical for MongoDB
+# because index behavior (text search, multikey, sorting), aggregation
+# pipelines, and transaction semantics are NOT 100% emulated by
+# mongomock. Note the [mongodb,kafka] extras: this is the most subtle
+# manifest difference from sibling relational services which use
+# [postgres,kafka]; using the wrong extras would silently fail to spin
+# up MongoDB containers in CI.
+#
+# mongomock + mongomock-motor provide a fast in-memory MongoDB
+# substitute for unit tests where a real container is overkill. They
+# faithfully emulate the basic CRUD and query surface but DO NOT
+# implement text-search relevance scoring, geospatial indexes, change
+# streams, or transactions — those are exercised exclusively in
+# integration tests via Testcontainers.
+#
+# respx mocks httpx calls (JWKS endpoint stubs, Schema Registry stubs).
+# freezegun enables deterministic time mocking for cache TTL tests
+# (JWKS cache, in-process category tree cache). faker / factory-boy
+# generate realistic fixture data (products with category-specific
+# attributes, category trees, media metadata).
+# =============================================================================
+factory-boy>=3.3.0,<4.0.0                                  # dev — fixture builder for product / category / media test entities
+faker>=24.0.0,<25.0.0                                      # dev — fixture data generators (products, categories, attributes)
+freezegun>=1.4.0,<2.0.0                                    # dev — time mocking for JWKS / category-tree cache TTL tests
+mongomock>=4.1.2,<5.0.0                                    # dev — in-memory MongoDB mock for fast unit tests (sync surface)
+mongomock-motor>=0.0.29,<1.0.0                             # dev — async-aware mongomock variant for motor-backed unit tests
+pytest>=8.0.0,<9.0.0                                       # dev — primary test runner
+pytest-asyncio>=0.23.0,<1.0.0                              # dev — async test support
+pytest-cov>=4.1.0,<5.0.0                                   # dev — coverage reporting
+respx>=0.21.0,<1.0.0                                       # dev — httpx request mocking (JWKS / Schema Registry stubs)
+testcontainers[kafka,mongodb]>=4.0.0,<5.0.0                # dev — real Kafka / MongoDB containers for integration tests
+
+
+# =============================================================================
+# OPERATOR NOTES
+# -----------------------------------------------------------------------------
+# 1. Install:
+#       python -m pip install -r requirements.txt
+#
+# 2. Reproducible builds (optional):
+#       pip-compile requirements.in -o requirements.lock
+#    Lockfile generation is recommended for production builds but not
+#    required by this project.
+#
+# 3. Container build dependencies (Dockerfile builder stage):
+#    System packages required to compile the wheels above:
+#       librdkafka-dev     (confluent-kafka)
+#       libssl-dev         (cryptography)
+#       libffi-dev         (cryptography / cffi)
+#       build-essential    (general C/C++ toolchain)
+#    Runtime stage installs only the shared-library counterparts:
+#       librdkafka1
+#       libssl3
+#
+#    NOTE: libpq / libpq-dev are NOT required — this service uses
+#    MongoDB, not PostgreSQL (per AAP R-7). Adding libpq to the
+#    Dockerfile would inflate the image size by ~3 MB for no benefit.
+#
+# 4. MongoDB Atlas (mongodb+srv://) connection strings:
+#    `dnspython` is included explicitly even though pymongo declares it
+#    as an optional dependency, to keep deployment simple. Without
+#    dnspython, every operator deploying to Atlas or any replica-set
+#    using SRV-record discovery would have to manually install it via
+#    a separate `requirements-extra.txt`. The few-KB cost of bundling
+#    it in every image is preferable to the deployment friction.
+#
+# 5. mongomock vs Testcontainers MongoDB:
+#    mongomock + mongomock-motor are for UNIT tests only. Real index
+#    behavior (text search, multikey, geospatial, sorting), aggregation
+#    pipelines, transactions, and change streams are NOT 100% emulated
+#    by mongomock. Tests that depend on those features MUST live under
+#    `tests/integration/` and use the Testcontainers MongoDB fixture
+#    in `tests/conftest.py`.
+#
+# 6. Schema Registry compatibility:
+#    confluent-kafka[schemaregistry] transitively pulls `requests`. Do
+#    not duplicate-pin requests in this manifest.
+#
+# 7. JWT validation only (AAP R-21):
+#    This service holds NO signing keys. pyjwt is used solely to verify
+#    RS256 / ES256 signatures against the Auth Service's public JWKS
+#    keyset. Any code path that attempts to call `jwt.encode()` with an
+#    asymmetric private key violates the architectural contract and
+#    must be rejected in code review.
+#
+# 8. Why no Redis?
+#    The Recommendation Engine consumes `product.*` events for
+#    embedding refresh AND has its OWN Redis cache for recommendations
+#    (AAP Section 0.4.4 — `rec_cache` keyspace). The Product Service
+#    does NOT need Redis: category-tree caching uses an in-process
+#    `cachetools.TTLCache` which is bounded, simple, and avoids the
+#    operational overhead of a sidecar or shared cache cluster.
+#
+# 9. Why no relational stack?
+#    AAP R-7 (polyglot persistence) selects MongoDB for the Product
+#    Service because product attributes vary widely by category. Adding
+#    psycopg / sqlalchemy / alembic would violate the architectural
+#    contract and inflate the image with unused libpq dependencies.
+#    The migration scripts under `migrations/` use the sync `pymongo`
+#    driver to create indexes, define schema validators, and apply
+#    seed data — there is no relational migration runner in this
+#    service.
+# =============================================================================
+
