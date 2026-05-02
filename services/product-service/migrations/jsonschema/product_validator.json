@@ -1,0 +1,130 @@
+{
+  "bsonType": "object",
+  "required": [
+    "_id",
+    "sku",
+    "name",
+    "slug",
+    "status",
+    "version",
+    "created_at",
+    "updated_at"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "_id": {
+      "bsonType": ["objectId", "string"],
+      "description": "MongoDB document identifier. Accepts ObjectId (driver default) or string (for deterministic ids if needed by integration scenarios)."
+    },
+    "attributes": {
+      "bsonType": "object",
+      "description": "Free-form per-category attributes (e.g., apparel: {size, color, fabric}; electronics: {voltage, capacity, weight}; groceries: {weight_grams, expiry_days, ingredients_list[]}). Application-layer Pydantic models constrain shape per category. The validator's `additionalProperties: true` setting and the lack of `properties` keys here mean ANY shape is permitted at the DB layer; this is by design (AAP R-7)."
+    },
+    "brand": {
+      "bsonType": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Brand or manufacturer name. Indexed by application-layer faceted search; not enforced UNIQUE by the validator (multiple products can share a brand)."
+    },
+    "category_ids": {
+      "bsonType": "array",
+      "minItems": 0,
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "bsonType": ["objectId", "string"]
+      },
+      "description": "Array of category ids (referencing `categories._id`). A product MAY belong to multiple categories (e.g., 'Men's Casual Shirts' AND 'Summer Sale'). Backed by the `idx_products__categories` multikey index. Capped at 32 to bound multikey index cost."
+    },
+    "created_at": {
+      "bsonType": "date",
+      "description": "UTC timestamp when the product was first created. Stored as MongoDB BSON date (millisecond precision). Immutable post-create."
+    },
+    "currency": {
+      "bsonType": "string",
+      "minLength": 3,
+      "maxLength": 3,
+      "pattern": "^[A-Z]{3}$",
+      "description": "ISO 4217 three-letter currency code (e.g., USD, EUR, INR, GBP, JPY). Required when `price` is set. The validator does NOT enforce that this is a known currency; the application validates against an ISO 4217 allow-list."
+    },
+    "description": {
+      "bsonType": "string",
+      "maxLength": 16384,
+      "description": "Long-form product description. May contain Markdown for storefront rendering. Indexed by `idx_products__text_search` (text index on name + description). Capped at 16 KiB to bound document size and text-index cost."
+    },
+    "media_ids": {
+      "bsonType": "array",
+      "minItems": 0,
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {
+        "bsonType": ["objectId", "string"]
+      },
+      "description": "Array of media ids (referencing `product_media._id`). The order of ids in this array IS the display order; the `product_media.sort_order` field is the authoritative source of truth for display order, but applications may also rely on this array's ordering for fast read-without-join. Capped at 64 media items per product."
+    },
+    "name": {
+      "bsonType": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "Human-readable product name. Indexed by `idx_products__text_search` (text index on name + description). Multi-language support is provided via attributes.localized_names; this field is the canonical English name."
+    },
+    "price": {
+      "bsonType": ["double", "decimal", "long", "int"],
+      "minimum": 0,
+      "description": "Price in the smallest currency unit (e.g., cents for USD, paise for INR) IF stored as integer; otherwise the value's units must match `currency` (e.g., USD as decimal). Application code SHOULD prefer Decimal128 for currency-safe arithmetic; `bsonType` accepts integer/long/double for legacy or partially-migrated data. Required at runtime when status is 'active'; not enforced REQUIRED here because draft products may exist without a finalized price."
+    },
+    "sku": {
+      "bsonType": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9_\\-]+$",
+      "description": "Immutable canonical product identifier (Stock Keeping Unit). UNIQUE across all products — enforced by the `idx_products__sku` index. Pattern restricts to ASCII alphanumeric with underscores/hyphens; spaces and special characters are rejected to keep SKUs URL-safe and grep-friendly. Capped at 64 characters to bound index size."
+    },
+    "slug": {
+      "bsonType": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "description": "URL-safe slug (lowercase alphanumeric with single-hyphen separators). UNIQUE across all products — enforced by the `idx_products__slug` index. Pattern matches the same regex as `categories.slug` for cross-collection consistency."
+    },
+    "status": {
+      "enum": ["draft", "active", "archived"],
+      "description": "Lifecycle state. 'draft' = not yet visible to storefront (admin-only); 'active' = visible and orderable; 'archived' = soft-deleted (kept for historical order references but hidden from storefront listings). Indexed by `idx_products__status_created` for fast admin filtered listings."
+    },
+    "updated_at": {
+      "bsonType": "date",
+      "description": "UTC timestamp of the most recent update. Backed by the `idx_products__updated` index for event-replay / outbox-reconciliation queries. Updated atomically with the `version` field on every write."
+    },
+    "variants": {
+      "bsonType": "array",
+      "minItems": 0,
+      "maxItems": 1024,
+      "items": {
+        "bsonType": "object",
+        "required": ["sku", "name"],
+        "additionalProperties": true,
+        "properties": {
+          "name": {
+            "bsonType": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "Variant display name (e.g., 'Red / Medium')."
+          },
+          "sku": {
+            "bsonType": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[A-Za-z0-9_\\-]+$",
+            "description": "Variant-level SKU. SHOULD be unique within the product but the validator does NOT enforce cross-variant uniqueness (the application enforces this at admin-write time)."
+          }
+        }
+      },
+      "description": "Embedded variant array. Each variant carries its own SKU (variant-level), display name, and optional attributes (color, size, etc., stored in additional properties). Capped at 1024 variants per product to bound document size; products with more variants should be split into multiple parent products."
+    },
+    "version": {
+      "bsonType": ["int", "long"],
+      "minimum": 0,
+      "description": "Optimistic-concurrency version counter. Incremented atomically on every update via `findOneAndUpdate({_id, version}, {$inc: {version: 1}, $set: {...}})`. Reads return the current version; writes that pass a stale version receive a 409 Conflict. Initial value on create is 0."
+    }
+  }
+}
