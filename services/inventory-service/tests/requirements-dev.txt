@@ -1,0 +1,198 @@
+# ============================================================================
+# Inventory Service — tests/requirements-dev.txt
+# ----------------------------------------------------------------------------
+# Test-only Python dependencies for the Inventory Service. These packages are
+# REQUIRED to run the unit and integration test suites under
+# services/inventory-service/tests/{unit,integration}/, but are NOT included
+# in the runtime Docker image to keep production deployments lean.
+#
+# Pairing with runtime manifest:
+#   - services/inventory-service/requirements.txt  (runtime + build deps)
+#   - services/inventory-service/tests/requirements-dev.txt  (this file)
+#
+# Local dev install (full test toolchain):
+#   pip install -r services/inventory-service/requirements.txt \
+#               -r services/inventory-service/tests/requirements-dev.txt
+#
+# CI install (per AAP Section 0.5.2.7):
+#   .github/workflows/ci.yml runs the same two-file install before pytest.
+#
+# Architecture diagram: docs/architecture/system-diagram.md
+# Python:               3.11+
+# AAP refs:             0.5.2.6, 0.5.2.7, 0.6.1, R-15, R-16, R-17, R-19, R-20,
+#                       R-25, R-26
+#
+# CONVENTION:
+#   - Pin to compatible-release (~=) on minor versions to allow patch upgrades
+#     without breaking minor-version contracts (consistent with runtime
+#     requirements.txt).
+#   - Test-only packages ONLY. Do NOT add runtime dependencies here — those
+#     belong in the runtime requirements.txt.
+#   - Do NOT add provider-specific test SDKs that this service does not need
+#     (Stripe/Razorpay test helpers, Twilio/SendGrid mocks belong to other
+#     services per AAP R-6 service-autonomy principle).
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# Core pytest framework
+# ----------------------------------------------------------------------------
+# pytest is the canonical test runner across every Python service in the
+# monorepo. The 8.x line provides built-in `tmp_path`, `monkeypatch`,
+# parametrize, and a stable fixture lifecycle that all sibling services
+# (order, notification, payment, recommendation) also target.
+#
+# pytest-asyncio enables `@pytest.mark.asyncio` and the asyncio event-loop
+# fixtures required by FastAPI's `httpx.AsyncClient` integration tests
+# (AAP R-19 health probe verification) and by direct asyncio handler tests.
+# Version 0.24.x is the line that aligns with pytest 8.x; 0.21 was the
+# last release for pytest 7.x.
+#
+# pytest-cov produces the coverage report consumed by the
+# .github/workflows/ci.yml threshold gate (target 85%+); it transitively
+# pulls in `coverage` so it is intentionally NOT listed separately here.
+#
+# pytest-mock supplies the `mocker` fixture that wraps `unittest.mock`
+# inside the pytest fixture lifecycle — strictly preferred over raw
+# `mock.patch` for cleanup determinism.
+#
+# pytest-timeout enforces per-test timeouts; integration tests cap at 60s
+# default to fail fast on a hung Testcontainers instance (AAP R-17).
+#
+# pytest-xdist enables `-n auto` parallel execution for unit tests only.
+# Integration tests must run serially because each test spawns its own
+# Testcontainers — port allocation collisions otherwise. The CI workflow
+# runs `pytest tests/unit/ -n auto` and `pytest tests/integration/`
+# (no `-n`) as separate steps.
+# ----------------------------------------------------------------------------
+pytest~=8.3.0
+pytest-asyncio~=0.24.0
+pytest-cov~=5.0.0
+pytest-mock~=3.14.0
+pytest-timeout~=2.3.0
+pytest-xdist~=3.6.0
+
+
+# ----------------------------------------------------------------------------
+# Testcontainers (AAP R-17 DLQ routing + saga step verification)
+# ----------------------------------------------------------------------------
+# testcontainers spins up real Postgres + Kafka brokers inside Docker
+# during integration tests, eliminating brittle Mock-laden affairs. The
+# `[kafka,postgres]` extras add the Kafka broker (with Schema Registry
+# bootstrap) lifecycle helper and the psycopg-aware Postgres lifecycle
+# helper. The bare `testcontainers` package would import-error at
+# `from testcontainers.kafka import KafkaContainer` — the extras are
+# mandatory for inventory's tests/integration/test_dlq_routing.py and
+# saga-step verification per AAP R-17.
+# ----------------------------------------------------------------------------
+testcontainers[kafka,postgres]~=4.8.0
+
+
+# ----------------------------------------------------------------------------
+# HTTP test utilities (AAP R-19 health probes; future warehouse adapter mocks)
+# ----------------------------------------------------------------------------
+# httpx is the async-first HTTP client used by FastAPI's `TestClient`
+# replacement (`httpx.AsyncClient`) for integration tests against the
+# `/health/live`, `/health/ready`, `/metrics`, and `/inventory/*` routes.
+#
+# IMPORTANT: This pin MUST stay EXACTLY synchronized with the runtime
+# `services/inventory-service/requirements.txt` pin (also `httpx~=0.27.0`)
+# so the test client and production HTTP client share identical wire
+# behavior — timeout handling, connection pooling, HTTP/2 negotiation.
+# Any drift causes subtle test-vs-prod divergence and is considered a
+# release-blocker bug.
+#
+# respx mocks outbound httpx calls at the transport layer, used by the
+# JWKS-fetch unit tests (Auth Service `/.well-known/jwks.json` per
+# AAP R-22) and reserved for future external warehouse adapters
+# (e.g., ExternalWMSWarehouseAdapter in the existing abstraction).
+# ----------------------------------------------------------------------------
+httpx~=0.27.0
+respx~=0.21.0
+
+
+# ----------------------------------------------------------------------------
+# Test data + deterministic time (AAP R-20 reservation expiry tests)
+# ----------------------------------------------------------------------------
+# faker generates synthetic SKU IDs, order IDs, warehouse names, and
+# addresses for fixture data. It is seeded deterministically in
+# `tests/conftest.py` via the `faker_seed` fixture (returns 20240101) so
+# CI runs reproduce identically across machines and developer sessions.
+#
+# freezegun is the keystone library for AAP R-20 verification. The
+# inventory-unique reservation expiry scheduler (apscheduler-driven, see
+# runtime requirements.txt section 2.9) periodically scans for expired
+# reservations whose RESERVATION_EXPIRY_MS deadline has lapsed and emits
+# `inventory.released` with `expired=true`. Without `freezegun`, expiry
+# tests would either sleep 15 minutes per assertion (untenable in CI) or
+# rely on time-mock injection through the scheduler API (couples tests
+# to implementation details). `freezegun.freeze_time(...)` and `tick(...)`
+# advance simulated wall-clock time deterministically past the expiry
+# threshold without modifying production code.
+# ----------------------------------------------------------------------------
+faker~=33.1.0
+freezegun~=1.5.0
+
+
+# ----------------------------------------------------------------------------
+# Schema + validation helpers
+# ----------------------------------------------------------------------------
+# jsonschema validates Kafka event payloads against the JSON Schema
+# definitions registered with Schema Registry per AAP R-14. The
+# repository-wide tests/contract/ folder validates schemas globally;
+# this service's tests/unit/events/ validates that produced event
+# payloads conform to the registered schema BEFORE being sent to
+# Kafka — preventing schema drift from leaking into production. The
+# 4.23.x line supports both Draft 7 and Draft 2020-12; inventory event
+# payloads use Draft 2020-12 (matching Schema Registry's JSON Schema
+# serializer default). The schemas themselves live under
+# `infrastructure/kafka/schemas/`.
+# ----------------------------------------------------------------------------
+jsonschema~=4.23.0
+
+
+# ----------------------------------------------------------------------------
+# Static analysis (test-time only; runtime imports unaffected)
+# ----------------------------------------------------------------------------
+# mypy is the type checker. CI runs it against src/ + tests/ to catch
+# type drift before merge — failures block the pipeline. Pinned here
+# (rather than in a separate `.tox` or `pre-commit` config) for one-stop
+# install ergonomics; mypy is a dev tool and MUST NOT be imported by
+# any test or runtime module.
+#
+# ruff is the linter + formatter. CI enforces zero violations on src/
+# and tests/. ruff replaces the legacy flake8 + isort + pyupgrade +
+# pydocstyle stack with a single fast Rust-implemented binary.
+# ----------------------------------------------------------------------------
+mypy~=1.13.0
+ruff~=0.7.0
+
+
+# ============================================================================
+# End of tests/requirements-dev.txt
+#
+# When updating versions:
+#   1. Bump only the patch component within a minor unless deliberate; major
+#      bumps (e.g., pytest 8 -> 9, testcontainers 4 -> 5) require a documented
+#      validation pass against tests/integration/.
+#   2. Keep `httpx~=0.27.0` pin EXACTLY synchronized with the runtime
+#      requirements.txt — diverging versions cause subtle test-vs-prod
+#      behavior differences (timeout handling, connection pooling).
+#   3. Keep `pytest-asyncio` aligned with `pytest`'s major version (asyncio
+#      0.24 supports pytest 8.x; 0.21 was last for pytest 7.x).
+#   4. Run `pip install -r requirements.txt -r tests/requirements-dev.txt`
+#      from a clean venv before committing version bumps to surface
+#      transitive conflicts (notably between pytest plugins).
+#
+# AAP CROSS-REFERENCES:
+#   - AAP Section 0.5.2.6 — Per-service unit + integration tests
+#   - AAP Section 0.5.2.7 — CI matrix build (.github/workflows/ci.yml)
+#   - AAP Section 0.6.1   — services/*/tests/{unit,integration}/**/* in scope
+#   - AAP R-15            — Retry policy verification
+#   - AAP R-16            — Circuit breaker verification
+#   - AAP R-17            — DLQ routing verification (Testcontainers Kafka)
+#   - AAP R-19            — Health probe verification
+#   - AAP R-20            — Reservation expiry scheduler tests (freezegun)
+#   - AAP R-25            — No real secrets in tests; respx for HTTP mocking
+#   - AAP R-26            — Structured JSON log capture in conftest.py
+# ============================================================================
