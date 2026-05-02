@@ -1,0 +1,260 @@
+# =============================================================================
+# Product Service — Default Configuration (Base Layer)
+# =============================================================================
+# Loaded FIRST by pydantic-settings at service startup (see ../src/config/
+# settings.py). Environment-specific overrides and environment variables take
+# higher precedence.
+#
+# Loading precedence (lowest → highest):
+#   1. default.yaml           (this file — base layer)
+#   2. <ENVIRONMENT>.yaml     (if present, e.g., local.yaml for ENVIRONMENT=local)
+#   3. environment variables  (highest — see ../.env.example)
+#
+# SECURITY (AAP R-25): This file contains NO secrets. MongoDB credentials,
+# Schema Registry auth, JWKS URLs (if private), OTEL endpoints, and any URL
+# bearing credentials are supplied via environment variables at runtime
+# (sourced from Kubernetes Secrets / Vault / cloud secret manager). The
+# authoritative env-var catalog lives in ../.env.example.
+#
+# DATABASE CHOICE (AAP R-7): This service uses MongoDB (not PostgreSQL).
+# Product attributes vary widely by category (apparel needs size/color,
+# electronics needs voltage/capacity, groceries needs weight/expiry); a
+# document model avoids JOIN overhead and schema migrations for new attribute
+# types. The `mongodb` section therefore has different keys than the
+# `postgres` section in sibling services.
+#
+# PRODUCER-ONLY DESIGN (AAP Section 0.5.2.2 bullet 4): This service is a
+# pure event producer; it has NO `kafka.consumer` block. Admin writes flow
+# exclusively over the synchronous HTTP API and trigger event emission.
+#
+# CROSS-FILE COUPLING:
+#   * Topic names in `kafka.topics.produced` MUST match event names in
+#     ../../../docs/architecture/event-catalog.md and AAP Section 0.4.2.
+#   * `service.port` (8000) MUST match the EXPOSE directive in ../Dockerfile
+#     and SERVICE_PORT in ../.env.example.
+#   * DLQ / retry topic suffixes MUST match AAP R-17 (`.dlq`, `.retry`).
+#   * `auth.audience` MUST match `service.name` ("product-service") and the
+#     JWT_AUDIENCE env var in ../.env.example.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 1. service — process identity, listen port, environment classifier
+# -----------------------------------------------------------------------------
+service:
+  name: product-service                   # logical service name; emitted in every log line (AAP R-26 "service" field)
+  version: 1.0.0                          # bump on every backward-incompatible change
+  port: 8000                              # HTTP listen port; MUST match Dockerfile EXPOSE and .env.example SERVICE_PORT
+  environment: ${ENVIRONMENT:local}       # resolved from ENVIRONMENT env var; default "local"; values: local | dev | stage | prod
+  health_paths:                           # AAP R-19 — liveness & readiness probe paths
+    live: /health/live                    # process-alive probe — never blocks on dependencies
+    ready: /health/ready                  # all critical deps reachable: MongoDB AND Kafka producer
+
+
+# -----------------------------------------------------------------------------
+# 2. mongodb — `product_db` driver settings (AAP R-6, R-7, Section 0.4.4)
+# -----------------------------------------------------------------------------
+# The Product Service owns its private `product_db` MongoDB instance per
+# AAP R-6 (database-per-service). Schema includes the three collections
+# defined in AAP Section 0.4.4: `products`, `categories`, `product_media`.
+# MONGODB_URL (which carries credentials) is supplied via env var per AAP R-25
+# and therefore does NOT appear here.
+mongodb:
+  # MONGODB_URL is supplied via env var (AAP R-25 — no URL with credentials in this file)
+  database: ${MONGODB_DATABASE:product_db}  # logical DB name; default product_db (matches AAP Section 0.4.4)
+  min_pool_size: 2                        # minimum idle connections in driver pool
+  max_pool_size: 50                       # maximum concurrent connections per instance (read-heavy workload)
+  connect_timeout_ms: 5000                # initial connect timeout
+  socket_timeout_ms: 10000                # per-operation socket timeout
+  server_selection_timeout_ms: 5000       # how long the driver waits for a primary
+  retry_writes: true                      # driver-level retry for transient write failures (AAP R-15)
+  retry_reads: true                       # driver-level retry for transient read failures
+  read_preference: primaryPreferred       # read from primary, fall back to secondary on outage
+  write_concern: majority                 # acknowledged by majority of replica-set members (durability)
+  tls_enabled: ${MONGODB_TLS_ENABLED:true}  # MUST be true in non-local environments (AAP R-24)
+  app_name: product-service               # identifies this client in MongoDB server logs
+
+
+# -----------------------------------------------------------------------------
+# 3. kafka — producer-only event publication (AAP R-14, R-17, R-30, R-32)
+# -----------------------------------------------------------------------------
+# This service is a PURE EVENT PRODUCER (AAP Section 0.5.2.2 bullet 4) — it
+# emits `product.created` and `product.updated` on every successful admin
+# write but never consumes Kafka topics. Therefore there is intentionally NO
+# `consumer` block, NO `consumer_group`, NO `auto_offset_reset`. Adding a
+# consumer block requires architectural review (AAP R-32 — producers must
+# not know consumers; consumer assumptions live in their own configs).
+kafka:
+  # KAFKA_BOOTSTRAP supplied via env var (AAP R-25)
+  client_id: product-service              # producer client.id for broker-side observability
+  producer:
+    acks: all                             # AAP R-14 — strongest durability for product events
+    enable_idempotence: true              # avoid duplicate event publication on retry
+    compression_type: lz4                 # wire compression for catalog payloads
+    linger_ms: 10                         # small batching window for throughput
+    batch_size_bytes: 32768               # 32 KiB batch buffer
+    request_timeout_ms: 30000
+    delivery_timeout_ms: 120000           # total budget per produce attempt chain (AAP R-15)
+  topics:
+    produced:                             # AAP Section 0.4.2 + 0.5.2.2 bullet 4 — events emitted
+      - product.created
+      - product.updated
+    dlq_suffix: .dlq                      # AAP R-17 — dead-letter topic naming convention
+    retry_suffix: .retry                  # AAP R-17 — retry topic naming convention
+  partition_key_field: product_id         # AAP R-30 implication — strict per-product ordering for consumers
+
+
+# -----------------------------------------------------------------------------
+# 4. schema_registry — Confluent Schema Registry binding (AAP R-14)
+# -----------------------------------------------------------------------------
+# Every produced event MUST validate against its registered schema before
+# being sent to a Kafka topic (AAP R-14). The schemas themselves live in
+# ../../../infrastructure/kafka/schemas/ and are registered with the
+# Schema Registry as part of the deployment pipeline. The subject map
+# below maps each topic's "value" subject to the canonical versioned
+# schema name; producers use this map at serialization time.
+schema_registry:
+  url: ${SCHEMA_REGISTRY_URL}             # Confluent Schema Registry URL (AAP R-14 — resolved at runtime)
+  # SCHEMA_REGISTRY_AUTH (optional Basic auth user:password) supplied via env (AAP R-25)
+  subjects:                               # event-name → Schema Registry subject map
+    product.created-value: product.created.v1
+    product.updated-value: product.updated.v1
+
+
+# -----------------------------------------------------------------------------
+# 5. catalog — domain configuration for browse / search / slug allocation
+# -----------------------------------------------------------------------------
+catalog:
+  default_page_size: 20                   # default page size for product / category list endpoints
+  max_page_size: 100                      # hard cap to prevent expensive scans
+  default_sort: created_at:desc           # default sort for product list (newest first)
+  slug_reserved_prefixes:                 # slugs that may not be used for products/categories
+    - admin
+    - api
+    - health
+    - metrics
+  soft_delete_grace_days: 30              # how long deprecated products remain queryable for admins before purge
+  text_search_language: english           # default MongoDB text-index language
+
+
+# -----------------------------------------------------------------------------
+# 6. idempotency — admin-write replay protection
+# -----------------------------------------------------------------------------
+# Admin writes (POST/PUT/DELETE on /products and /categories) accept an
+# `Idempotency-Key` header so a client can retry a failed call safely
+# without producing duplicate `product.*` events. The key + a hash of the
+# request body is persisted briefly; matching keys return the original
+# response, mismatched hashes return `409 Conflict`.
+idempotency:
+  key_header: Idempotency-Key             # inbound API header for idempotent admin writes (RFC draft convention)
+  key_ttl_hours: 24                       # how long to remember a key (admin writes are infrequent)
+  request_hash_algo: sha256               # algorithm used to fingerprint request bodies for replay-mismatch detection
+
+
+# -----------------------------------------------------------------------------
+# 7. resilience — retry + circuit-breaker policies (AAP R-15, R-16)
+# -----------------------------------------------------------------------------
+# Outbound HTTP traffic is intentionally minimal for this service —
+# primarily JWKS fetches from the Auth Service. Both HTTP calls and
+# Kafka produce paths are protected by a circuit breaker per AAP R-16;
+# HTTP additionally has a tenacity-driven retry policy per AAP R-15.
+resilience:
+  http:                                   # outbound HTTP client (JWKS fetch, future external integrations)
+    retry:                                # AAP R-15 — exponential backoff + jitter, bounded attempts
+      max_attempts: 3
+      initial_delay_ms: 200
+      multiplier: 2.0
+      max_delay_ms: 5000
+      jitter_pct: 0.2
+    circuit_breaker:                      # AAP R-16
+      failure_rate_threshold: 50          # percent
+      call_volume_threshold: 20
+      open_duration_ms: 30000
+      half_open_permitted_calls: 1
+  kafka:
+    producer_circuit_breaker:             # AAP R-16 — wraps outbound Kafka produce paths
+      failure_rate_threshold: 50          # percent
+      call_volume_threshold: 20
+      open_duration_ms: 30000
+      half_open_permitted_calls: 1
+
+
+# -----------------------------------------------------------------------------
+# 8. auth — JWT validation (AAP R-21, R-22, R-23)
+# -----------------------------------------------------------------------------
+# This service VALIDATES JWTs minted by the Auth Service. Per AAP R-21 the
+# Auth Service is the SOLE issuer of JWT tokens; this service never mints
+# them. Public keys are fetched from the JWKS endpoint and cached with a
+# bounded TTL per AAP R-22. Asymmetric algorithms only per AAP R-23 —
+# symmetric algorithms (HS256/384/512) are FORBIDDEN here because they
+# would imply this service shares a signing secret with the Auth Service.
+auth:
+  jwks_url: ${JWT_PUBLIC_KEY_URL}         # JWKS endpoint from Auth Service (AAP R-22 — resolved at runtime)
+  jwks_cache_ttl_seconds: 3600            # bounded TTL for JWKS key cache (AAP R-22)
+  issuer: ${JWT_ISSUER}                   # expected `iss` JWT claim (AAP R-21 — Auth Service is sole issuer)
+  audience: product-service               # expected `aud` JWT claim — MUST match service.name
+  algorithms:                             # accepted JWT signing algorithms (AAP R-23 — asymmetric only)
+    - RS256
+    - ES256
+  required_scopes:                        # per-endpoint OAuth 2.0 scope requirements
+    admin: products:admin                 # scope required for admin POST/PUT/DELETE on products & categories
+  leeway_seconds: 30                      # clock-skew tolerance on `exp`/`nbf` claims
+
+
+# -----------------------------------------------------------------------------
+# 9. observability — correlation IDs, metrics, tracing (AAP R-13, R-26, R-27)
+# -----------------------------------------------------------------------------
+# Structured JSON logs (AAP R-26) ship via Filebeat to Logstash (AAP R-27);
+# logger wiring lives in `./log_config.json` — this section documents the
+# architectural intent. The correlation ID generated at the API Gateway is
+# propagated through every HTTP call and Kafka message header (AAP R-13)
+# for distributed tracing.
+observability:
+  correlation_id:
+    header: X-Correlation-ID              # AAP R-13 — propagated across HTTP and Kafka message headers
+  metrics:
+    port: 9090                            # /metrics endpoint port (scraped by Metricbeat per AAP R-27)
+    path: /metrics
+  tracing:
+    otel_endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT}  # OpenTelemetry collector endpoint (resolved at runtime)
+    service_name: product-service                  # OpenTelemetry resource attribute; matches service.name
+    sampler: parentbased_always_on                 # sample every trace by default; collector handles head sampling
+
+
+# -----------------------------------------------------------------------------
+# 10. features — domain feature flags
+# -----------------------------------------------------------------------------
+# Stable features default to `true`; expensive or experimental features
+# default to `false` so they are opt-in per environment after validation.
+# The category tree cache uses an in-process LRU (cachetools) — adding
+# Redis is intentionally NOT done here because the category tree is small
+# and changes infrequently.
+features:
+  text_search_enabled: true               # enable MongoDB text-index search on /products?q=
+  faceted_search_enabled: false           # aggregation-pipeline faceted search (more expensive); off by default
+  category_tree_cache:
+    enabled: true                         # in-process LRU cache for category tree reads (cachetools)
+    ttl_seconds: 300                      # 5-minute TTL
+    max_size: 1024                        # LRU cap (entries)
+
+
+# =============================================================================
+# END OF DEFAULT CONFIGURATION
+# -----------------------------------------------------------------------------
+# Next loading step: pydantic-settings applies any <ENVIRONMENT>.yaml overrides,
+# then applies env-var overrides. See ../.env.example for the full env-var
+# catalog and ../README.md for service-level documentation.
+#
+# REMINDERS (Product Service):
+#   * Never put MONGODB_URL here — it carries credentials (AAP R-25).
+#   * Never put SCHEMA_REGISTRY_AUTH here — it carries credentials (AAP R-25).
+#   * Never put JWT signing keys here — this service only validates JWTs via
+#     JWKS fetched from the Auth Service (AAP R-21).
+#   * The producer-only design (no `kafka.consumer` block) is intentional —
+#     this service emits domain events but never consumes them. Adding a
+#     consumer block requires architectural review.
+#   * The two produced topics (`product.created`, `product.updated`) are the
+#     authoritative list — adding a third topic requires a coordinated edit
+#     to ../../../docs/architecture/event-catalog.md and registration of a
+#     new schema in ../../../infrastructure/kafka/schemas/.
+# =============================================================================
