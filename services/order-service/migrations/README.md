@@ -35,29 +35,29 @@ migrations/
 ├── script.py.mako                                   # Mako template used to generate new revision files
 ├── README.md                                        # This file
 └── versions/                                        # Individual revision files (chronologically ordered)
-    ├── 0001_create_orders_table.py                  # CREATE TABLE orders + indexes; CREATE EXTENSION pgcrypto
-    ├── 0002_create_order_items_table.py             # CREATE TABLE order_items + intra-DB FK to orders
-    ├── 0003_create_order_status_history.py          # CREATE TABLE order_status_history + composite index
-    ├── 0004_create_saga_state_table.py              # CREATE TABLE saga_state + partial indexes (AAP R-18)
-    └── 0005_seed_initial_data.py                    # Optional supplementary CHECK constraints; no runtime data seeding
+    ├── 20260101_000001_create_orders_table.py       # CREATE TABLE orders + indexes; CREATE EXTENSION pgcrypto
+    ├── 20260101_000002_create_order_items_table.py  # CREATE TABLE order_items + intra-DB FK to orders
+    ├── 20260101_000003_create_order_status_history.py  # CREATE TABLE order_status_history + composite index
+    ├── 20260101_000004_create_saga_state_table.py   # CREATE TABLE saga_state + partial indexes (AAP R-18)
+    └── 20260101_000005_seed_initial_data.py         # Optional supplementary CHECK constraints; no runtime data seeding
 ```
 
 - **`alembic.ini`** — Alembic CLI configuration. The `sqlalchemy.url` key is intentionally **empty**; `env.py` populates it at runtime from `POSTGRES_URL` (AAP R-25).
 - **`env.py`** — Defines both online and offline migration modes; reads `POSTGRES_URL` from the environment, rewrites a bare `postgresql://` URL to `postgresql+psycopg://`, and propagates `version_table=alembic_version_order_service` to both `context.configure()` calls.
 - **`script.py.mako`** — Mako template used by `alembic revision -m "..."` to scaffold new revision files.
-- **`versions/0001_create_orders_table.py`** — Enables the `pgcrypto` extension and creates the `orders` aggregate-root table with the `UNIQUE` constraint on `idempotency_key` plus the composite index `idx_orders__user_created` on `(user_id, created_at DESC)`.
-- **`versions/0002_create_order_items_table.py`** — Creates the `order_items` line-item table with the intra-database foreign key `order_items.order_id REFERENCES orders(id) ON DELETE CASCADE`.
-- **`versions/0003_create_order_status_history.py`** — Creates the append-only `order_status_history` audit log with the composite index `idx_order_status_history__order_time` on `(order_id, occurred_at)`.
-- **`versions/0004_create_saga_state_table.py`** — Creates the `saga_state` table with the partial indexes `idx_saga_state__deadline` (for the timeout-driven compensation scheduler) and `idx_saga_state__awaiting` (for Kafka-event correlation lookups). This is the AAP R-18 durability guarantee.
-- **`versions/0005_seed_initial_data.py`** — Reserved for optional supplementary CHECK constraints or non-essential housekeeping. Does **not** seed runtime data; the canonical domain enums are CHECK-constraint-enforced inline within the `0001`–`0004` migrations.
+- **`versions/20260101_000001_create_orders_table.py`** — Enables the `pgcrypto` extension and creates the `orders` aggregate-root table with the `UNIQUE` constraint on `idempotency_key` plus the composite index `idx_orders__user_created` on `(user_id, created_at DESC)`.
+- **`versions/20260101_000002_create_order_items_table.py`** — Creates the `order_items` line-item table with the intra-database foreign key `order_items.order_id REFERENCES orders(id) ON DELETE CASCADE`.
+- **`versions/20260101_000003_create_order_status_history.py`** — Creates the append-only `order_status_history` audit log with the composite index `idx_order_status_history__order_time` on `(order_id, occurred_at)`.
+- **`versions/20260101_000004_create_saga_state_table.py`** — Creates the `saga_state` table with the partial indexes `idx_saga_state__deadline` (for the timeout-driven compensation scheduler) and `idx_saga_state__awaiting` (for Kafka-event correlation lookups). This is the AAP R-18 durability guarantee.
+- **`versions/20260101_000005_seed_initial_data.py`** — Reserved for optional supplementary CHECK constraints or non-essential housekeeping. Does **not** seed runtime data; the canonical domain enums are CHECK-constraint-enforced inline within the `20260101_000001`–`20260101_000004` migrations.
 
-The bootstrap migrations use **ordinal prefixes** (`0001_`, `0002_`, ...) to convey the intended apply order at first sight. Subsequent migrations created via `alembic revision -m "..."` will use the `<YYYYMMDD>_<HHMMSS>_<slug>.py` template specified by `file_template` in [`./alembic.ini`](./alembic.ini); both naming patterns coexist safely because Alembic resolves the dependency graph from the `down_revision` chain, not from filename order.
+The bootstrap migrations use the same **`<YYYYMMDD>_<HHMMSS>_<slug>.py`** filename convention emitted by Alembic's auto-generation (`file_template` in [`./alembic.ini`](./alembic.ini)) so all revisions — bootstrap and post-bootstrap alike — share a single uniform naming pattern. This matches the convention used by the sibling `services/notification-service/migrations/versions/` and `services/payment-service/migrations/versions/` folders for cross-service consistency. Alembic resolves the dependency graph from the `down_revision` chain, not from filename order, so future revisions appended via `alembic revision -m "..."` will slot in seamlessly.
 
 ## Naming Convention
 
-- **Bootstrap revision filenames:** `<NNNN>_<snake_case_slug>.py` (for example, `0001_create_orders_table.py`). The four-digit zero-padded ordinal expresses the intended apply order of the initial schema.
-- **Subsequent (post-bootstrap) revisions:** `<YYYYMMDD>_<HHMMSS>_<snake_case_slug>.py` per the `file_template` setting in [`./alembic.ini`](./alembic.ini); the `timezone = UTC` setting in the same file guarantees deterministic, contributor-independent timestamps.
-- Each revision file declares `revision = "<id>"` at the top (for example, `revision = "0001"` or `revision = "20260101_000001"`); the file's identifier matches the prefix exactly.
+- **All revision filenames** use the `<YYYYMMDD>_<HHMMSS>_<snake_case_slug>.py` template per the `file_template` setting in [`./alembic.ini`](./alembic.ini); the `timezone = UTC` setting in the same file guarantees deterministic, contributor-independent timestamps. This matches the convention used by the sibling `services/notification-service/migrations/versions/` and `services/payment-service/migrations/versions/` folders for cross-service consistency.
+- The bootstrap revisions are stamped at the synthetic UTC instant `2026-01-01 00:00:0N` so that ordering remains both deterministic and human-readable; subsequent `alembic revision -m "..."` invocations stamp the actual UTC time at generation.
+- Each revision file declares `revision = "<id>"` at the top (for example, `revision = "20260101_000001"`); the file's identifier matches the filename prefix exactly.
 - New revisions are generated by `alembic revision -m "short description"`. The `--autogenerate` flag is **not used** because `target_metadata = None` (see [Toolchain](#toolchain)); migrations are written by hand.
 - **Never reuse** a revision id.
 - **Never edit** a revision file that has already been applied in any environment — see [Rollback Policy](#rollback-policy).
@@ -86,12 +86,12 @@ The four tables required by **AAP Section 0.4.4** are created by the bootstrap m
 
 | Table | Purpose | Created by |
 |-------|---------|------------|
-| `orders` | Aggregate root — one row per customer order (`id`, `user_id`, `status`, `currency`, `total_amount`, `idempotency_key` UNIQUE, `correlation_id`, `created_at`, `updated_at`, `version`) | `0001_create_orders_table.py` |
-| `order_items` | Line items per order (`order_id` intra-DB FK, `line_no`, `product_id`, `quantity`, `unit_price`, `line_total`) | `0002_create_order_items_table.py` |
-| `order_status_history` | Append-only audit log of state transitions (`id`, `order_id` intra-DB FK, `from_status`, `to_status`, `reason`, `correlation_id`, `occurred_at`) | `0003_create_order_status_history.py` |
-| `saga_state` | **Durable saga coordinator persistence (AAP R-18)** — `order_id` intra-DB FK + PK, `saga_id`, `current_step`, `awaiting_event`, `retry_count`, `deadline_at`, `compensation_required`, `last_error`, `correlation_id`, `updated_at` | `0004_create_saga_state_table.py` |
+| `orders` | Aggregate root — one row per customer order (`id`, `user_id`, `status`, `currency`, `total_amount`, `idempotency_key` UNIQUE, `correlation_id`, `created_at`, `updated_at`, `version`) | `20260101_000001_create_orders_table.py` |
+| `order_items` | Line items per order (`order_id` intra-DB FK, `line_no`, `product_id`, `quantity`, `unit_price`, `line_total`) | `20260101_000002_create_order_items_table.py` |
+| `order_status_history` | Append-only audit log of state transitions (`id`, `order_id` intra-DB FK, `from_status`, `to_status`, `reason`, `correlation_id`, `occurred_at`) | `20260101_000003_create_order_status_history.py` |
+| `saga_state` | **Durable saga coordinator persistence (AAP R-18)** — `order_id` intra-DB FK + PK, `saga_id`, `current_step`, `awaiting_event`, `retry_count`, `deadline_at`, `compensation_required`, `last_error`, `correlation_id`, `updated_at` | `20260101_000004_create_saga_state_table.py` |
 
-The `0005_seed_initial_data.py` revision is reserved for optional supplementary CHECK constraints or non-essential housekeeping — it does **not** seed runtime data. Domain enums are CHECK-constraint-enforced inline within the `0001`–`0004` migrations.
+The `20260101_000005_seed_initial_data.py` revision is reserved for optional supplementary CHECK constraints or non-essential housekeeping — it does **not** seed runtime data. Domain enums are CHECK-constraint-enforced inline within the `20260101_000001`–`20260101_000004` migrations.
 
 ## Schema Isolation (AAP R-6)
 

@@ -14,7 +14,7 @@
   ],
   "properties": {
     "event_id": {"type": "string", "format": "uuid"},
-    "event_type": {"type": "string", "const": "OrderCancelled"},
+    "event_type": {"type": "string", "const": "order.cancelled"},
     "event_version": {"type": "integer", "minimum": 1},
     "occurred_at": {"type": "string", "format": "date-time"},
     "correlation_id": {"type": "string"},

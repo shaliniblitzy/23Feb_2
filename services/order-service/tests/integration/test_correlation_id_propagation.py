@@ -699,7 +699,8 @@ def _make_inventory_reserved_payload(
     import datetime as _dt
 
     return {
-        "version": 1,
+        "event_type": "inventory.reserved",
+        "event_version": 1,
         "order_id": str(order_id),
         "saga_id": str(saga_id),
         "reservation_id": str(reservation_id or uuid.uuid4()),
@@ -735,7 +736,8 @@ def _make_inventory_reservation_failed_payload(
     import datetime as _dt
 
     return {
-        "version": 1,
+        "event_type": "inventory.reservation_failed",
+        "event_version": 1,
         "order_id": str(order_id),
         "saga_id": str(saga_id),
         "reason": reason,
@@ -768,7 +770,8 @@ def _make_payment_succeeded_payload(
     import datetime as _dt
 
     return {
-        "version": 1,
+        "event_type": "payment.succeeded",
+        "event_version": 1,
         "order_id": str(order_id),
         "saga_id": str(saga_id),
         "payment_id": str(payment_id or uuid.uuid4()),

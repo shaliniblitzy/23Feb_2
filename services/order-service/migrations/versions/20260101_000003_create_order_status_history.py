@@ -1,7 +1,7 @@
 """create_order_status_history
 
-Revision ID: 0003
-Revises: 0002
+Revision ID: 20260101_000003
+Revises: 20260101_000002
 Create Date: 2026-01-01 00:00:03.000000
 
 Create order_status_history table -- append-only audit log of order status
@@ -40,8 +40,8 @@ from alembic import op
 import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
-revision: str = "0003"
-down_revision: Union[str, Sequence[str], None] = "0002"
+revision: str = "20260101_000003"
+down_revision: Union[str, Sequence[str], None] = "20260101_000002"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -75,7 +75,7 @@ def upgrade() -> None:
       orders.status CHECK (e.g., to add 'PARTIALLY_FULFILLED' or
       'BACKORDERED'), the audit log MUST be able to record those new
       states without requiring a paired migration here. The orders table
-      itself (revision 0001) is the canonical enum guard via
+      itself (revision 20260101_000001) is the canonical enum guard via
       ck_orders__status_enum; the audit log mirrors what was applied
       without re-enforcing.
 
@@ -206,7 +206,7 @@ def upgrade() -> None:
     # op.create_index(...) is appropriate here because the index is a
     # regular (non-partial, non-DESC) B-tree index. Raw op.execute(...)
     # is reserved for partial indexes (per the sibling notification-
-    # service convention) and DESC indexes (per revision 0001's
+    # service convention) and DESC indexes (per revision 20260101_000001's
     # idx_orders__user_created).
     # ------------------------------------------------------------------
     op.create_index(

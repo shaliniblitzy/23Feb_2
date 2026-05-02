@@ -1,26 +1,28 @@
 """seed_initial_data
 
-Revision ID: 0005
-Revises: 0004
+Revision ID: 20260101_000005
+Revises: 20260101_000004
 Create Date: 2026-01-01 00:00:05.000000
 
 Bootstrap-chain terminus revision (no-op placeholder).
 
 The order_db schema requires NO static reference data at bootstrap:
-  * Order status values are enforced via CHECK constraint in revision 0001
-    (CREATE TABLE orders ... CHECK (status IN ('CREATED', ...))).
-  * Saga step values are enforced via CHECK constraint in revision 0004
-    (CREATE TABLE saga_state ... CHECK (current_step IN ('CREATE_ORDER', ...))).
+  * Order status values are enforced via CHECK constraint in revision
+    20260101_000001 (CREATE TABLE orders ... CHECK (status IN
+    ('CREATED', ...))).
+  * Saga step values are enforced via CHECK constraint in revision
+    20260101_000004 (CREATE TABLE saga_state ... CHECK (current_step IN
+    ('CREATE_ORDER', ...))).
   * No lookup tables are required because the enum sets are small, stable,
     and validated at the application layer via Pydantic + StrEnum models.
 
 This revision exists to:
   1. Provide a known terminus for the bootstrap revision chain so operators
      and tooling can identify the end-of-bootstrap state with `alembic
-     current` returning '0005' immediately after first apply.
+     current` returning '20260101_000005' immediately after first apply.
   2. Reserve a slot for future bootstrap seed data (e.g., a default tenant
      row, a default saga timeout reference table) without renumbering the
-     existing revisions 0001-0004.
+     existing revisions 20260101_000001-20260101_000004.
 
 Both upgrade() and downgrade() are intentional no-ops. Future seed-data
 migrations should be written as NEW forward revisions (e.g.,
@@ -34,8 +36,8 @@ from alembic import op
 import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
-revision: str = "0005"
-down_revision: Union[str, Sequence[str], None] = "0004"
+revision: str = "20260101_000005"
+down_revision: Union[str, Sequence[str], None] = "20260101_000004"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -44,8 +46,8 @@ def upgrade() -> None:
     """Apply forward migration.
 
     No-op: order_db has no static reference data at bootstrap. Order status
-    and saga step enums are enforced by CHECK constraints in revisions 0001
-    and 0004; no lookup tables are required.
+    and saga step enums are enforced by CHECK constraints in revisions
+    20260101_000001 and 20260101_000004; no lookup tables are required.
 
     This revision is intentionally a placeholder so the bootstrap chain has
     a known terminus. Future seed-data migrations should be authored as new

@@ -21,7 +21,7 @@
   ],
   "properties": {
     "event_id": {"type": "string", "format": "uuid"},
-    "event_type": {"type": "string", "const": "PaymentRefunded"},
+    "event_type": {"type": "string", "const": "payment.refunded"},
     "event_version": {"type": "integer", "minimum": 1, "const": 1},
     "occurred_at": {"type": "string", "format": "date-time"},
     "payment_id": {"type": "string", "format": "uuid"},

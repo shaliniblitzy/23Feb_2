@@ -255,7 +255,8 @@ def _make_order_cancelled_payload(
 
     Matches the JSON-Schema definition in
     ``services/payment-service/src/events/schemas/order_cancelled.json``:
-    requires ``event_id``, ``event_type`` (= ``"OrderCancelled"``),
+    requires ``event_id``, ``event_type`` (= ``"order.cancelled"``,
+    lowercase-dotted matching the topic name per AAP R-30),
     ``event_version`` (integer >= 1), ``occurred_at``, ``order_id``;
     optional ``customer_id``, ``cancellation_reason``, ``correlation_id``.
 
@@ -294,7 +295,7 @@ def _make_order_cancelled_payload(
     ts = occurred_at or datetime.now(timezone.utc).isoformat()
     return {
         "event_id": str(event_id or uuid.uuid4()),
-        "event_type": "OrderCancelled",
+        "event_type": "order.cancelled",
         "event_version": 1,
         "occurred_at": ts,
         "correlation_id": correlation_id or str(uuid.uuid4()),
@@ -350,7 +351,7 @@ def _make_order_created_payload(
 
     payload: dict[str, Any] = {
         "event_id": str(event_id or uuid.uuid4()),
-        "event_type": "OrderCreated",
+        "event_type": "order.created",
         "event_version": 1,
         "occurred_at": datetime.now(timezone.utc).isoformat(),
         "correlation_id": correlation_id or str(uuid.uuid4()),
@@ -718,7 +719,7 @@ async def test_order_cancelled_kafka_triggers_full_refund_via_original_provider(
         raw_value = raw_value.decode("utf-8")
     refunded_event = json.loads(raw_value)
 
-    assert refunded_event["event_type"] == "PaymentRefunded"
+    assert refunded_event["event_type"] == "payment.refunded"
     assert refunded_event["event_version"] == 1, (
         "AAP R-31: events include a version field"
     )
@@ -1878,7 +1879,8 @@ async def test_refund_emits_payment_refunded_event_with_proper_schema(
     ``services/payment-service/src/events/schemas/payment_refunded.json``):
 
     * ``event_id`` (UUID string)
-    * ``event_type`` (constant ``"PaymentRefunded"``)
+    * ``event_type`` (constant ``"payment.refunded"`` -- lowercase-dotted,
+      matching the Kafka topic name per AAP R-30)
     * ``event_version`` (integer 1)
     * ``occurred_at`` (RFC 3339 ISO 8601)
     * ``payment_id`` (UUID)
@@ -1896,8 +1898,8 @@ async def test_refund_emits_payment_refunded_event_with_proper_schema(
     * ``x-schema-version`` = ``"v1"`` - schema-evolution discriminator
     * ``x-service`` = ``"payment-service"`` - producer attribution
     * ``x-event-type`` = ``"payment.refunded"`` - kafka-level event-type
-      facet (mirrors the topic name; see also payload's ``event_type``
-      field which uses the CamelCase form ``"PaymentRefunded"``)
+      facet; identical to the payload's ``event_type`` field (both
+      lowercase-dotted ``<domain>.<verb>`` per AAP R-30)
     """
     refund_amount = Decimal("42.00")
 
@@ -1991,7 +1993,7 @@ async def test_refund_emits_payment_refunded_event_with_proper_schema(
         )
 
     # Field shape and value assertions.
-    assert event["event_type"] == "PaymentRefunded"
+    assert event["event_type"] == "payment.refunded"
     assert event["event_version"] == 1, "AAP R-31: integer event version"
     uuid.UUID(event["event_id"])
     uuid.UUID(event["payment_id"])

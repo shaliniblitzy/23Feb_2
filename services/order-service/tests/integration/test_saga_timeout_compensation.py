@@ -332,7 +332,8 @@ def _make_inventory_reserved_event(
         ``inventory.reserved`` topic.
     """
     return {
-        "version": 1,
+        "event_type": "inventory.reserved",
+        "event_version": 1,
         "order_id": str(order_id),
         "saga_id": str(saga_id),
         "reservation_id": str(reservation_id or uuid.uuid4()),
@@ -1178,7 +1179,8 @@ async def test_saga_scheduler_does_not_compensate_terminated_sagas(
         correlation_id=correlation_id,
     )
     payment_event = {
-        "version": 1,
+        "event_type": "payment.succeeded",
+        "event_version": 1,
         "order_id": str(order_id),
         "saga_id": str(saga_id),
         "payment_id": str(uuid.uuid4()),
@@ -1642,7 +1644,8 @@ async def test_saga_timeout_does_not_apply_to_terminated_sagas_with_old_deadline
         correlation_id=correlation_id,
     )
     payment_event = {
-        "version": 1,
+        "event_type": "payment.succeeded",
+        "event_version": 1,
         "order_id": str(order_id),
         "saga_id": str(saga_id),
         "payment_id": str(uuid.uuid4()),

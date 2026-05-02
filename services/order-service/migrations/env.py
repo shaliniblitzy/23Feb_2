@@ -38,9 +38,9 @@ this service (AAP R-18). The Order Service's saga coordinator commits the
 Kafka offset and the saga_state row mutation in the SAME PostgreSQL
 transaction (driven by ``transaction_per_migration=True`` in
 ``run_migrations_online()`` for the migration path; the runtime code uses
-its own ``BEGIN/COMMIT`` blocks). If revision 0004 (saga_state creation)
-or any future ALTER TABLE on saga_state partially applies and fails
-halfway, the orders/order_items state from earlier revisions is
+its own ``BEGIN/COMMIT`` blocks). If revision 20260101_000004 (saga_state
+creation) or any future ALTER TABLE on saga_state partially applies and
+fails halfway, the orders/order_items state from earlier revisions is
 unaffected -- which is the sole reason ``transaction_per_migration=True``
 is set below rather than the Alembic default (``False``, single
 transaction wrapping the entire upgrade).
@@ -557,8 +557,9 @@ def run_migrations_online() -> None:
     * ``transaction_per_migration=True`` -- each revision file runs in
       its own transaction so a partial failure rolls back cleanly. This
       is CRITICAL for the order-service: the saga_state table addition
-      (revision 0004) and any future ALTER TABLE on saga_state must be
-      transactional to preserve in-flight saga durability per AAP R-18.
+      (revision 20260101_000004) and any future ALTER TABLE on saga_state
+      must be transactional to preserve in-flight saga durability per
+      AAP R-18.
       The Alembic default (``False``) wraps the entire ``alembic upgrade
       head`` in a single transaction, which means a failure on revision
       N rolls back N-1, N-2, ... too -- unacceptable when order-domain

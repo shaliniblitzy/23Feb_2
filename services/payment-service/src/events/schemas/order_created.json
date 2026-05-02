@@ -24,7 +24,8 @@
     },
     "event_type": {
       "type": "string",
-      "const": "OrderCreated"
+      "const": "order.created",
+      "description": "Constant identifier for this event type. Matches the Kafka topic name (lowercase-dotted) per AAP R-30."
     },
     "event_version": {
       "type": "integer",

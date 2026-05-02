@@ -1,7 +1,7 @@
 """create_saga_state_table
 
-Revision ID: 0004
-Revises: 0003
+Revision ID: 20260101_000004
+Revises: 20260101_000003
 Create Date: 2026-01-01 00:00:04.000000
 
 Create saga_state table -- the LINCHPIN for AAP R-18 saga recovery.
@@ -68,8 +68,8 @@ from alembic import op
 import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
-revision: str = "0004"
-down_revision: Union[str, Sequence[str], None] = "0003"
+revision: str = "20260101_000004"
+down_revision: Union[str, Sequence[str], None] = "20260101_000003"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -387,11 +387,11 @@ def downgrade() -> None:
       pattern. IF EXISTS guards against double-downgrade.
 
     What we do NOT drop here:
-      * orders table (revision 0001 owns its drop).
-      * pgcrypto extension (revision 0001 enabled it but intentionally
-        does NOT drop it -- other tables may depend on it).
-      * order_items, order_status_history (revisions 0002, 0003 own
-        their drops).
+      * orders table (revision 20260101_000001 owns its drop).
+      * pgcrypto extension (revision 20260101_000001 enabled it but
+        intentionally does NOT drop it -- other tables may depend on it).
+      * order_items, order_status_history (revisions 20260101_000002,
+        20260101_000003 own their drops).
     """
     # Drop partial indexes first (in reverse creation order). Raw SQL
     # for symmetry with the CREATE INDEX raw SQL in upgrade(). IF EXISTS

@@ -41,11 +41,15 @@ All event classes inherit from a private :class:`_EventBase` that enforces:
 
 Versioning Discipline (AAP R-31)
 --------------------------------
-``event_version`` is a free-form string (e.g. ``"1.0.0"``, ``"v1.2"``).
-The Notification Service is forward-compatible with any ``event_version``
-value satisfying the field constraints; the Schema Registry on the
-producer side enforces semantic versioning compatibility
-(``backward`` / ``forward`` / ``full``).
+``event_version`` is a positive integer (``int >= 1``). This matches
+the canonical wire-format envelope adopted across every service in
+the platform (Payment Service, Order Service, Recommendation Engine
+and this service): producers bump the integer monotonically when the
+schema evolves in a backward-incompatible way; consumers branch on
+``event_version`` to handle the new shape. The Schema Registry on
+the producer side additionally enforces structural-compatibility
+(``backward`` / ``forward`` / ``full``) on top of this integer
+discriminator.
 
 Side-effect freedom
 -------------------
@@ -167,15 +171,18 @@ LocaleStr = Annotated[
     ),
 ]
 
-# ``event_version`` is a free-form producer-supplied semver-ish string
-# (e.g. "1.0.0", "v1.2", "2024-04"). The Schema Registry on the producer
-# side enforces the actual compatibility semantics; the consumer just
-# requires the field to be present, non-empty, and of a sane length so
-# that it can flow into structured logs and DLQ metadata without ever
-# becoming the cause of a downstream parsing failure.
-EventVersionStr = Annotated[
-    str,
-    StringConstraints(strip_whitespace=True, min_length=1, max_length=32),
+# ``event_version`` is a positive integer (>= 1) shared by every event in
+# the platform's canonical wire envelope. The integer is bumped
+# monotonically by the producer when the schema evolves in a backward-
+# incompatible way; consumers branch on the value to handle the new shape.
+# This consumer just requires the field to be a positive int so that it
+# can flow into structured logs and DLQ metadata without ever becoming
+# the cause of a downstream parsing failure. The Schema Registry on the
+# producer side additionally enforces structural-compatibility
+# (``backward`` / ``forward`` / ``full``) on top of this discriminator.
+EventVersionInt = Annotated[
+    int,
+    Field(ge=1, description="Positive integer event-schema version (AAP R-31)."),
 ]
 
 
@@ -220,7 +227,7 @@ class _EventBase(BaseModel):
 
     event_id: UUID
     user_id: UUID
-    event_version: EventVersionStr
+    event_version: EventVersionInt
     occurred_at: datetime
 
     @field_validator("occurred_at")
@@ -691,16 +698,17 @@ class PaymentRefundedEvent(_EventBase):
 # ---------------------------------------------------------------------------
 # `_EventBase`, the regex constants (`_CURRENCY_PATTERN`, `_E164_PATTERN`,
 # `_LOCALE_PATTERN`), the reusable Annotated aliases (`NonEmptyStr`,
-# `CurrencyCode`, `PhoneE164`, `LocaleStr`, `EventVersionStr`), and the
+# `CurrencyCode`, `PhoneE164`, `LocaleStr`, `EventVersionInt`), and the
 # `PaymentProvider` Literal alias are all intentionally NOT exported from
 # this module. They are private implementation details:
 #
 #   * `_EventBase` -- subclassing should be confined to this module.
 #   * Regex constants -- pattern bounds are an implementation detail; if
 #     they need to change in the future, callers should not rely on them.
-#   * Reusable Annotated aliases -- they exist solely to deduplicate the
-#     constraint declarations across event classes; downstream code that
-#     needs a constrained string should declare its own constraints.
+#   * Reusable Annotated aliases (including `EventVersionInt`) -- they
+#     exist solely to deduplicate the constraint declarations across event
+#     classes; downstream code that needs a constrained scalar should
+#     declare its own constraints.
 #   * `PaymentProvider` -- a future `src.domain.types` module may declare
 #     a public `PaymentProvider` alias; pre-emptively keeping this private
 #     avoids a name conflict.

@@ -3,7 +3,7 @@
 This sub-package contains the canonical implementation of the saga pattern
 for the e-commerce platform. It coordinates the multi-service checkout
 flow with explicit compensation paths and durable state in the
-``saga_state`` Postgres table (created by Alembic revision 0004).
+``saga_state`` Postgres table (created by Alembic revision 20260101_000004).
 
 Modules:
     state_machine

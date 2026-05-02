@@ -27,7 +27,13 @@ Module responsibilities
 
    * ``occurred_at`` MUST be timezone-aware (rejects naive ``datetime`` per
      AAP R-26 RFC 3339 timestamps).
-   * ``event_version`` MUST be a non-empty string of <= 64 characters.
+   * ``event_version`` MUST be a positive integer (``int >= 1``). This
+     matches the canonical wire-format envelope adopted across every
+     service in the platform (Notification Service, Order Service,
+     Payment Service JSON-Schemas, and this service).
+   * ``event_type`` MUST be the lowercase-dotted Kafka topic name as a
+     ``Literal`` (e.g. ``"product.created"``); enforced by Pydantic's
+     ``Literal`` validator on every event class (AAP R-30).
    * ``category_path`` segments MUST match the injection-safe pattern
      ``^[A-Za-z0-9._/\\- ]{1,128}$`` (defense against SQL/log forging).
 
@@ -66,9 +72,11 @@ Compliance with AAP rules
 - **R-26** — RFC 3339 timezone-aware timestamps enforced via the
   ``_validate_tz_aware`` helper used by every event class.
 - **R-30** — Class names mirror the ``<domain>.<verb>`` Kafka topic naming
-  convention (e.g. ``product.created`` -> ``ProductCreatedEvent``).
-- **R-31** — ``extra="ignore"`` plus required ``event_version`` field on
-  every class together support backward-compatible schema evolution.
+  convention (e.g. ``product.created`` -> ``ProductCreatedEvent``); each
+  class declares an ``event_type: Literal[<topic_name>]`` field whose
+  value is identical to the topic name in lowercase-dotted form.
+- **R-31** — ``extra="ignore"`` plus required ``event_version: int`` field
+  on every class together support backward-compatible schema evolution.
 - **R-33** — Models are self-contained; no model construction triggers an
   external lookup or side effect.
 
@@ -84,6 +92,7 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from decimal import Decimal
+from typing import Literal
 from uuid import UUID
 
 from pydantic import (
@@ -235,9 +244,9 @@ class _EventBase(BaseModel):
       the Python attribute name might be unreachable from certain code
       paths (e.g. ``model_construct`` calls).
     * ``str_strip_whitespace=True`` — defensive trimming on every string
-      field. Combined with ``Field(min_length=1)`` on ``event_version``,
-      this rejects whitespace-only inputs declaratively, without needing
-      a custom validator.
+      field. The integer ``event_version`` field uses ``Field(ge=1)`` to
+      reject zero/negative values declaratively, without needing a
+      custom validator.
 
     Privacy
     -------
@@ -380,6 +389,8 @@ class ProductCreatedEvent(_EventBase):
        consumer offsets reset — do not double-write the same embedding.
 
     Attributes:
+        event_type: Constant ``"product.created"`` -- lowercase-dotted
+            event identifier matching the Kafka topic name (AAP R-30).
         product_id: UUID of the product being created.
         category_path: Hierarchical category breadcrumb (e.g.
             ``["electronics", "phones", "smartphones"]``). Defaults to
@@ -393,17 +404,20 @@ class ProductCreatedEvent(_EventBase):
             free-text and the producer's own schema bounds them.
         occurred_at: RFC 3339 timestamp of when the product was created.
             Must be timezone-aware; naive datetimes are rejected.
-        event_version: Producer-side schema version (semver-ish string,
-            1-64 chars). Required on every event so consumers can branch
-            on schema evolution.
+        event_version: Producer-side schema version (positive integer,
+            ``>= 1``). Required on every event so consumers can branch
+            on schema evolution. Type chosen to match the unified wire
+            envelope used by the Notification Service, Order Service, and
+            Payment Service JSON-Schemas.
     """
 
+    event_type: Literal["product.created"] = "product.created"
     product_id: UUID
     category_path: list[str] = Field(default_factory=list)
     price: Decimal | None = None
     tags: list[str] = Field(default_factory=list)
     occurred_at: datetime
-    event_version: str = Field(..., min_length=1, max_length=64)
+    event_version: int = Field(..., ge=1)
 
     @field_validator("occurred_at")
     @classmethod
@@ -462,6 +476,8 @@ class ProductUpdatedEvent(_EventBase):
        stale recommendation lists for affected users.
 
     Attributes:
+        event_type: Constant ``"product.updated"`` -- lowercase-dotted
+            event identifier matching the Kafka topic name (AAP R-30).
         product_id: UUID of the product being updated.
         category_path: Hierarchical category breadcrumb; defaults to ``[]``.
             Each segment is validated against
@@ -473,15 +489,17 @@ class ProductUpdatedEvent(_EventBase):
             update — partial / delta tag updates are NOT supported in
             this event shape.
         occurred_at: RFC 3339 timestamp of the update.
-        event_version: Producer-side schema version (1-64 chars).
+        event_version: Producer-side schema version (positive integer,
+            ``>= 1``).
     """
 
+    event_type: Literal["product.updated"] = "product.updated"
     product_id: UUID
     category_path: list[str] = Field(default_factory=list)
     price: Decimal | None = None
     tags: list[str] = Field(default_factory=list)
     occurred_at: datetime
-    event_version: str = Field(..., min_length=1, max_length=64)
+    event_version: int = Field(..., ge=1)
 
     @field_validator("occurred_at")
     @classmethod
@@ -551,6 +569,8 @@ class OrderCreatedEvent(_EventBase):
     later cancelled or returned.
 
     Attributes:
+        event_type: Constant ``"order.created"`` -- lowercase-dotted event
+            identifier matching the Kafka topic name (AAP R-30).
         order_id: UUID of the newly created order.
         user_id: UUID of the customer who placed the order.
         line_items: Per-product line items. Validated as
@@ -558,9 +578,11 @@ class OrderCreatedEvent(_EventBase):
             OR ``items``; Python attribute access is always
             ``event.line_items``.
         occurred_at: RFC 3339 timestamp of order creation.
-        event_version: Producer-side schema version (1-64 chars).
+        event_version: Producer-side schema version (positive integer,
+            ``>= 1``).
     """
 
+    event_type: Literal["order.created"] = "order.created"
     order_id: UUID
     user_id: UUID
     line_items: list[OrderLineItem] = Field(
@@ -569,7 +591,7 @@ class OrderCreatedEvent(_EventBase):
         validation_alias=AliasChoices("line_items", "items"),
     )
     occurred_at: datetime
-    event_version: str = Field(..., min_length=1, max_length=64)
+    event_version: int = Field(..., ge=1)
 
     @field_validator("occurred_at")
     @classmethod
@@ -609,15 +631,19 @@ class OrderFulfilledEvent(_EventBase):
     unavailable (AAP R-20 — fallback declared for every dependency).
 
     Attributes:
+        event_type: Constant ``"order.fulfilled"`` -- lowercase-dotted
+            event identifier matching the Kafka topic name (AAP R-30).
         order_id: UUID of the fulfilled order.
         user_id: UUID of the customer.
         line_items: Per-product line items. Each may carry an optional
             ``rating`` reflecting post-delivery satisfaction. Accepts
             payload key ``line_items`` OR ``items``.
         occurred_at: RFC 3339 timestamp of fulfillment.
-        event_version: Producer-side schema version (1-64 chars).
+        event_version: Producer-side schema version (positive integer,
+            ``>= 1``).
     """
 
+    event_type: Literal["order.fulfilled"] = "order.fulfilled"
     order_id: UUID
     user_id: UUID
     line_items: list[OrderLineItem] = Field(
@@ -626,7 +652,7 @@ class OrderFulfilledEvent(_EventBase):
         validation_alias=AliasChoices("line_items", "items"),
     )
     occurred_at: datetime
-    event_version: str = Field(..., min_length=1, max_length=64)
+    event_version: int = Field(..., ge=1)
 
     @field_validator("occurred_at")
     @classmethod
@@ -671,6 +697,8 @@ class UserRegisteredEvent(_EventBase):
     without changing anything).
 
     Attributes:
+        event_type: Constant ``"user.registered"`` -- lowercase-dotted
+            event identifier matching the Kafka topic name (AAP R-30).
         user_id: UUID of the newly registered user.
         preferences: Optional arbitrary key->value string map. Defaults
             to ``None`` (treated identically to an empty dict by the
@@ -682,14 +710,16 @@ class UserRegisteredEvent(_EventBase):
             scoring. No pattern validation here; the producer-side
             schema bounds the shape.
         occurred_at: RFC 3339 timestamp of registration.
-        event_version: Producer-side schema version (1-64 chars).
+        event_version: Producer-side schema version (positive integer,
+            ``>= 1``).
     """
 
+    event_type: Literal["user.registered"] = "user.registered"
     user_id: UUID
     preferences: dict[str, str] | None = None
     region: str | None = None
     occurred_at: datetime
-    event_version: str = Field(..., min_length=1, max_length=64)
+    event_version: int = Field(..., ge=1)
 
     @field_validator("occurred_at")
     @classmethod
@@ -724,19 +754,23 @@ class UserUpdatedEvent(_EventBase):
     enforces SEMANTIC no-op detection.
 
     Attributes:
+        event_type: Constant ``"user.updated"`` -- lowercase-dotted event
+            identifier matching the Kafka topic name (AAP R-30).
         user_id: UUID of the user whose profile changed.
         preferences: Updated preferences map (full replacement, not
             delta). Defaults to ``None``.
         region: Updated region identifier. Defaults to ``None``.
         occurred_at: RFC 3339 timestamp of the update.
-        event_version: Producer-side schema version (1-64 chars).
+        event_version: Producer-side schema version (positive integer,
+            ``>= 1``).
     """
 
+    event_type: Literal["user.updated"] = "user.updated"
     user_id: UUID
     preferences: dict[str, str] | None = None
     region: str | None = None
     occurred_at: datetime
-    event_version: str = Field(..., min_length=1, max_length=64)
+    event_version: int = Field(..., ge=1)
 
     @field_validator("occurred_at")
     @classmethod

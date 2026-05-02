@@ -1,7 +1,7 @@
 """create_order_items_table
 
-Revision ID: 0002
-Revises: 0001
+Revision ID: 20260101_000002
+Revises: 20260101_000001
 Create Date: 2026-01-01 00:00:02.000000
 
 Create order_items table -- line items belonging to an order.
@@ -34,8 +34,8 @@ from alembic import op
 import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
-revision: str = "0002"
-down_revision: Union[str, Sequence[str], None] = "0001"
+revision: str = "20260101_000002"
+down_revision: Union[str, Sequence[str], None] = "20260101_000001"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

@@ -305,11 +305,11 @@ class SagaState(BaseModel):
       uses this column to detect concurrent writers.
 
     Why ``version`` is in the in-memory class but NOT in the DDL
-    of revision 0004
+    of revision 20260101_000004
     -----------------------------------------------------------
     The ``version`` column is added by a forthcoming migration
-    revision (or by extending revision 0004 if not yet applied to
-    production). Until then, the repository may simulate
+    revision (or by extending revision 20260101_000004 if not yet
+    applied to production). Until then, the repository may simulate
     optimistic locking via ``updated_at`` comparison or a SELECT
     FOR UPDATE. The in-memory class declares the field upfront so
     application code doesn't churn when the column lands.

@@ -1,6 +1,6 @@
 """create_orders_table
 
-Revision ID: 0001
+Revision ID: 20260101_000001
 Revises:
 Create Date: 2026-01-01 00:00:01.000000
 
@@ -11,7 +11,7 @@ This revision performs two operations:
 1. Enables the pgcrypto PostgreSQL extension to make gen_random_uuid()
    available as a server-side UUID v4 default. Required because all
    UUID primary keys in order_db (orders.id, eventually saga_state.saga_id
-   in revision 0004) are server-generated when not supplied by the
+   in revision 20260101_000004) are server-generated when not supplied by the
    application.
 
 2. Creates the orders aggregate-root table with the schema documented in
@@ -46,7 +46,7 @@ from alembic import op
 import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
-revision: str = "0001"
+revision: str = "20260101_000001"
 down_revision: Union[str, Sequence[str], None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None

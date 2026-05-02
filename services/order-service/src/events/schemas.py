@@ -2,8 +2,15 @@
 
 In-process representations of the canonical JSON-Schemas registered in
 the Confluent Schema Registry (under ``infrastructure/kafka/schemas/``).
-Every event payload carries a ``version: int`` field per AAP R-31 so
-backward-compatible schema evolution is auditable end-to-end.
+Every event payload carries the unified wire envelope used across every
+service in the platform:
+
+* ``event_type``    -- ``Literal["<domain>.<verb>"]`` lowercase-dotted
+                       event identifier matching the Kafka topic name
+                       (AAP R-30).
+* ``event_version`` -- positive integer schema discriminator (AAP R-31)
+                       so backward-compatible schema evolution is
+                       auditable end-to-end.
 
 Models exported:
 
@@ -35,14 +42,22 @@ All event classes inherit from a private :class:`_BaseEvent` that enforces:
   constraints rather than slipping through.
 - ``extra="ignore"``              -- forward-compatible by design: a consumer
   built against version N silently ignores fields added in version N+1.
-  Combined with ``version: int`` this realises AAP R-14 (Schema Registry
-  validates produce; consumers tolerate evolution).
+  Combined with ``event_version: int`` this realises AAP R-14 (Schema
+  Registry validates produce; consumers tolerate evolution).
 - ``populate_by_name=True``       -- field aliases (if any) work for both alias
   and Python attribute name; future-proofs schema evolution.
-- ``version: int`` field with ``ge=1`` -- declared once on the base class so
-  authors of new events cannot forget it (AAP R-31). The ``Field(..., ge=1)``
-  annotation makes 0 (the int default) invalid, preventing accidentally-
-  uninitialised events.
+- ``event_version: int`` field with ``ge=1`` -- declared once on the base
+  class so authors of new events cannot forget it (AAP R-31). The
+  ``Field(..., ge=1)`` annotation makes 0 (the int default) invalid,
+  preventing accidentally-uninitialised events.
+
+Each concrete event class additionally declares an ``event_type:
+Literal["<domain>.<verb>"]`` constant (AAP R-30) that defaults to its
+literal value. The literal enables type narrowing in mypy, makes wire
+identification explicit on every payload, and matches the
+lowercase-dotted topic name exactly for consistency with the Notification
+Service Pydantic schemas, the Payment Service JSON-Schemas, and the
+Recommendation Engine event models.
 
 Money in minor units
 --------------------
@@ -85,9 +100,10 @@ Authority
 - AAP R-18           -- Saga pattern with explicit compensation steps; the
                         consumed events drive saga state transitions.
 - AAP R-30           -- Topic names mirror event names: the ``order.created``
-                        topic carries ``OrderCreatedEvent`` payloads.
-- AAP R-31           -- Every event payload includes a ``version: int`` field
-                        for backward-compatible evolution.
+                        topic carries ``OrderCreatedEvent`` payloads, whose
+                        ``event_type`` field equals ``"order.created"``.
+- AAP R-31           -- Every event payload includes an ``event_version: int``
+                        field (>= 1) for backward-compatible evolution.
 - AAP R-32           -- Producers do not enumerate consumers; consumers parse
                         self-contained payloads.
 - AAP R-33           -- Events are self-contained; consumers do not need to
@@ -98,7 +114,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -118,14 +134,26 @@ class _BaseEvent(BaseModel):
     * String whitespace stripping at the validation boundary (defensive).
     * Forward-compatibility (``extra="ignore"``): unknown fields from a newer
       producer are silently dropped instead of raising at the consumer.
-    * The mandatory ``version: int`` field (AAP R-31). ``Field(..., ge=1)``
-      makes ``0`` invalid, preventing accidentally-uninitialised events.
+    * The mandatory ``event_version: int`` field (AAP R-31).
+      ``Field(..., ge=1)`` makes ``0`` invalid, preventing accidentally-
+      uninitialised events.
     * ``populate_by_name=True`` so future field aliases work transparently.
 
     The class is intentionally PRIVATE (leading underscore): it has no
     semantic meaning outside this module and must not appear in
     :data:`__all__`. Consumer code should depend on the concrete event
     classes, not on this base.
+
+    Subclasses MUST declare:
+        * ``event_type``: a ``Literal[<dotted-event-name>]`` constant
+          whose value matches the corresponding Kafka topic name in
+          lowercase-dotted form (AAP R-30). The constant enables type
+          narrowing in mypy and provides ergonomic test construction
+          (the field defaults to its literal value).
+        * Any additional domain-specific fields required by the event.
+
+    Subclasses MUST NOT redeclare:
+        * ``event_version`` -- inherited unchanged from this base.
     """
 
     # ------------------------------------------------------------------
@@ -147,7 +175,7 @@ class _BaseEvent(BaseModel):
         populate_by_name=True,
     )
 
-    version: int = Field(
+    event_version: int = Field(
         ...,
         ge=1,
         description=(
@@ -155,7 +183,10 @@ class _BaseEvent(BaseModel):
             "0 is reserved as the int default sentinel and rejected at "
             "validation time. Producers bump this when they evolve the "
             "schema; the producer module surfaces it as the "
-            "``schema-version`` Kafka header for fast-skip in consumers."
+            "``schema-version`` Kafka header for fast-skip in consumers. "
+            "Field name and type intentionally match the unified wire "
+            "envelope used by the Notification Service, Payment Service "
+            "JSON-Schemas, and the Recommendation Engine event models."
         ),
     )
 
@@ -317,7 +348,9 @@ class OrderCreatedEvent(_BaseEvent):
     consumers; downstream services subscribe and act independently.
 
     Attributes:
-        version: Schema version (inherited; AAP R-31).
+        event_type: Constant ``"order.created"`` -- lowercase-dotted
+            event identifier matching the Kafka topic name (AAP R-30).
+        event_version: Schema version (inherited; AAP R-31).
         order_id: Order aggregate id (matches ``orders.id``).
         saga_id: Saga instance id (matches ``saga_state.saga_id``).
         user_id: Owning user (foreign-conceptual; no FK per AAP R-6).
@@ -334,6 +367,7 @@ class OrderCreatedEvent(_BaseEvent):
             ``idempotency.max_length`` in ``default.yaml``).
     """
 
+    event_type: Literal["order.created"] = "order.created"
     order_id: UUID = Field(
         ...,
         description="Order aggregate id (matches orders.id).",
@@ -400,7 +434,9 @@ class OrderCancelledEvent(_BaseEvent):
     the Order Service to decide whether they must compensate.
 
     Attributes:
-        version: Schema version (inherited; AAP R-31).
+        event_type: Constant ``"order.cancelled"`` -- lowercase-dotted
+            event identifier matching the Kafka topic name (AAP R-30).
+        event_version: Schema version (inherited; AAP R-31).
         order_id: Order aggregate id.
         saga_id: Saga instance id.
         user_id: Owning user id.
@@ -420,6 +456,7 @@ class OrderCancelledEvent(_BaseEvent):
         occurred_at: UTC RFC 3339 timestamp of cancellation.
     """
 
+    event_type: Literal["order.cancelled"] = "order.cancelled"
     order_id: UUID = Field(
         ...,
         description="Order aggregate id (matches orders.id).",
@@ -491,7 +528,9 @@ class OrderFulfilledEvent(_BaseEvent):
     can act without callbacks (AAP R-33).
 
     Attributes:
-        version: Schema version (inherited; AAP R-31).
+        event_type: Constant ``"order.fulfilled"`` -- lowercase-dotted
+            event identifier matching the Kafka topic name (AAP R-30).
+        event_version: Schema version (inherited; AAP R-31).
         order_id: Order aggregate id.
         saga_id: Saga instance id.
         user_id: Owning user id.
@@ -504,6 +543,7 @@ class OrderFulfilledEvent(_BaseEvent):
         items: Fulfilled line items; ``min_length=1``, ``max_length=200``.
     """
 
+    event_type: Literal["order.fulfilled"] = "order.fulfilled"
     order_id: UUID = Field(
         ...,
         description="Order aggregate id (matches orders.id).",
@@ -567,7 +607,9 @@ class InventoryReservedEvent(_BaseEvent):
         the saga then triggers the payment capture step.
 
     Attributes:
-        version: Schema version (inherited; AAP R-31).
+        event_type: Constant ``"inventory.reserved"`` -- lowercase-dotted
+            event identifier matching the Kafka topic name (AAP R-30).
+        event_version: Schema version (inherited; AAP R-31).
         order_id: Owning order id (matches the OrderCreatedEvent.order_id
             that triggered the reservation).
         saga_id: Owning saga id.
@@ -580,6 +622,7 @@ class InventoryReservedEvent(_BaseEvent):
             event for zero items is meaningless.
     """
 
+    event_type: Literal["inventory.reserved"] = "inventory.reserved"
     order_id: UUID = Field(
         ...,
         description="Owning order id; mirrors OrderCreatedEvent.order_id.",
@@ -621,7 +664,10 @@ class InventoryReservationFailedEvent(_BaseEvent):
         ``reason=CancellationReason.INVENTORY_FAILED``.
 
     Attributes:
-        version: Schema version (inherited; AAP R-31).
+        event_type: Constant ``"inventory.reservation_failed"`` --
+            lowercase-dotted event identifier matching the Kafka topic
+            name (AAP R-30).
+        event_version: Schema version (inherited; AAP R-31).
         order_id: Owning order id.
         saga_id: Owning saga id.
         reason_code: Machine-readable reason code (e.g.,
@@ -633,6 +679,7 @@ class InventoryReservationFailedEvent(_BaseEvent):
         occurred_at: UTC RFC 3339 timestamp of the failure.
     """
 
+    event_type: Literal["inventory.reservation_failed"] = "inventory.reservation_failed"
     order_id: UUID = Field(
         ...,
         description="Owning order id; mirrors OrderCreatedEvent.order_id.",
@@ -678,7 +725,9 @@ class PaymentSucceededEvent(_BaseEvent):
         :class:`OrderFulfilledEvent` to terminate the saga on the happy path.
 
     Attributes:
-        version: Schema version (inherited; AAP R-31).
+        event_type: Constant ``"payment.succeeded"`` -- lowercase-dotted
+            event identifier matching the Kafka topic name (AAP R-30).
+        event_version: Schema version (inherited; AAP R-31).
         order_id: Owning order id.
         saga_id: Owning saga id.
         payment_id: Payment Service's payment aggregate id (opaque
@@ -694,6 +743,7 @@ class PaymentSucceededEvent(_BaseEvent):
         captured_at: UTC RFC 3339 timestamp of the successful capture.
     """
 
+    event_type: Literal["payment.succeeded"] = "payment.succeeded"
     order_id: UUID = Field(
         ...,
         description="Owning order id; mirrors OrderCreatedEvent.order_id.",
@@ -755,7 +805,9 @@ class PaymentFailedEvent(_BaseEvent):
         has the final say.
 
     Attributes:
-        version: Schema version (inherited; AAP R-31).
+        event_type: Constant ``"payment.failed"`` -- lowercase-dotted
+            event identifier matching the Kafka topic name (AAP R-30).
+        event_version: Schema version (inherited; AAP R-31).
         order_id: Owning order id.
         saga_id: Owning saga id.
         payment_id: Payment Service's payment aggregate id; may be ``None``
@@ -773,6 +825,7 @@ class PaymentFailedEvent(_BaseEvent):
         failed_at: UTC RFC 3339 timestamp of the failure.
     """
 
+    event_type: Literal["payment.failed"] = "payment.failed"
     order_id: UUID = Field(
         ...,
         description="Owning order id; mirrors OrderCreatedEvent.order_id.",

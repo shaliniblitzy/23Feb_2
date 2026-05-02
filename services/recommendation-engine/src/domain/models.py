@@ -223,9 +223,13 @@ class Features(BaseModel):
         purchase_count: Lifetime purchase count (>= 0).
         last_interaction_at: Timestamp of the most recent interaction
             (RFC 3339, UTC). MUST be timezone-aware.
-        last_event_version: Version string of the most recent event applied
-            to this row (1..64 chars). Used to short-circuit replay on
-            consumer restart and to detect schema regressions.
+        last_event_version: Positive integer schema-version of the most
+            recent event applied to this row (``int >= 1``). Type chosen
+            to mirror the unified wire envelope adopted across every
+            service (Notification Service, Order Service, Payment
+            Service JSON-Schemas, and the Recommendation Engine event
+            models). Used to short-circuit replay on consumer restart
+            and to detect schema regressions.
     """
 
     model_config = _BASE_CONFIG
@@ -235,7 +239,7 @@ class Features(BaseModel):
     view_count: int = Field(ge=0)
     purchase_count: int = Field(ge=0)
     last_interaction_at: datetime
-    last_event_version: str = Field(min_length=1, max_length=64)
+    last_event_version: int = Field(ge=1)
 
     @field_validator("last_interaction_at")
     @classmethod
@@ -272,8 +276,9 @@ class FeatureDelta(BaseModel):
         rating_value: Optional 0..5 rating that replaces the existing rating.
         occurred_at: Timestamp of the source event (RFC 3339, UTC). MUST be
             timezone-aware.
-        event_version: Version string of the source event schema
-            (1..64 chars).
+        event_version: Positive integer schema-version of the source event
+            (``int >= 1``). Mirrors the wire-format ``event_version: int``
+            adopted across the platform's canonical envelope.
     """
 
     model_config = _BASE_CONFIG
@@ -284,7 +289,7 @@ class FeatureDelta(BaseModel):
     purchase_count_delta: int = 0
     rating_value: float | None = Field(default=None, ge=0.0, le=5.0)
     occurred_at: datetime
-    event_version: str = Field(min_length=1, max_length=64)
+    event_version: int = Field(ge=1)
 
     @field_validator("occurred_at")
     @classmethod

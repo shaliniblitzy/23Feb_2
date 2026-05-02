@@ -695,7 +695,7 @@ async def test_kafka_consumer_log_has_required_fields(
     product_id = str(uuid.uuid4())
     event_payload: dict[str, Any] = {
         "event_id": str(uuid.uuid4()),
-        "event_type": "ProductCreatedEvent",
+        "event_type": "product.created",
         "event_version": 1,
         "occurred_at": datetime.now(timezone.utc).isoformat(),
         "product_id": product_id,
@@ -876,7 +876,7 @@ async def test_no_plaintext_logs_emitted(
     #    side of the application's logging surface.
     event_payload: dict[str, Any] = {
         "event_id": str(uuid.uuid4()),
-        "event_type": "ProductCreatedEvent",
+        "event_type": "product.created",
         "event_version": 1,
         "occurred_at": datetime.now(timezone.utc).isoformat(),
         "product_id": str(uuid.uuid4()),
@@ -983,7 +983,7 @@ async def test_expected_metrics_present_after_activity(
     correlation_id = str(uuid.uuid4())
     event_payload: dict[str, Any] = {
         "event_id": str(uuid.uuid4()),
-        "event_type": "ProductCreatedEvent",
+        "event_type": "product.created",
         "event_version": 1,
         "occurred_at": datetime.now(timezone.utc).isoformat(),
         "product_id": str(uuid.uuid4()),
