@@ -1,0 +1,314 @@
+# =============================================================================
+# User Service — Default Runtime Configuration (Base Layer)
+# =============================================================================
+# Authoritative defaults for every runtime setting consumed by the FastAPI app.
+# Loaded at startup via pydantic_settings.YamlConfigSettingsSource; environment
+# variables declared in ../.env.example override these defaults at the Pydantic
+# settings layer. NEVER add secrets here — DB credentials, JWT signing keys,
+# Schema Registry credentials, and Kafka SASL credentials must come exclusively
+# from environment variables sourced from Kubernetes Secrets / Vault (AAP R-25).
+#
+# This service is BOTH a Kafka consumer AND producer:
+#   - Consumes: user.registered (from Auth Service)
+#   - Produces: user.updated, user.deleted (to Notification, Recommendation)
+#
+# Cross-references:
+#   - AAP Section 0.5.2.5 Group 5 — per-service default configuration
+#   - AAP Section 0.6.1            — services/*/config/**/*.yaml in scope
+#   - AAP R-25                     — secrets MUST come from env, not files
+#   - AAP R-26                     — structured JSON logs (see ./log_config.json)
+#   - ../.env.example              — env variable catalogue (groups A–N)
+#   - ./log_config.json            — Python logging dictConfig (uvicorn --log-config)
+#   - ../Dockerfile                — mounts this file at /app/config/default.yaml
+#
+# Conventions:
+#   - All time durations use _ms (milliseconds), _seconds, _minutes, _hours,
+#     or _days suffix as appropriate
+#   - All keys use snake_case
+#   - 2-space indentation
+#   - Each leaf key is annotated with the env var that overrides it
+#   - Empty strings ("") on credential-style keys mean "must be supplied via env"
+# =============================================================================
+
+# --- Group A: Service Identity ----------------------------------------------
+service:
+  name: user-service                            # env: SERVICE_NAME
+  environment: local                            # env: ENVIRONMENT      (local | dev | staging | prod)
+  version: 0.1.0                                # bump on every backward-incompatible release
+
+# --- Group A: Logging (AAP R-26) --------------------------------------------
+logging:
+  level: INFO                                   # env: LOG_LEVEL        (DEBUG | INFO | WARN | ERROR)
+  format: json                                  # env: LOG_FORMAT       (json mandated by AAP R-26 outside local dev)
+
+# --- Group A: HTTP Server ---------------------------------------------------
+http:
+  host: 0.0.0.0                                 # env: HTTP_HOST
+  port: 8000                                    # env: HTTP_PORT        (matches Dockerfile EXPOSE)
+  workers: 2                                    # env: HTTP_WORKERS     (uvicorn worker count; matches Dockerfile CMD)
+  request_timeout_seconds: 30                   # env: HTTP_REQUEST_TIMEOUT_SECONDS  (server-side wall-clock timeout per request)
+  keepalive_seconds: 5                          # env: HTTP_KEEPALIVE_SECONDS
+  cors_allowed_origins: ""                      # env: CORS_ALLOWED_ORIGINS  (comma-separated; empty in non-local since gateway terminates CORS)
+  trusted_proxies: ""                           # env: TRUSTED_PROXIES       (comma-separated CIDRs for X-Forwarded-For parsing)
+
+# --- Group B: PostgreSQL (user_db; AAP R-6, R-7, Section 0.4.4) -------------
+# NO credentials here per AAP R-25. POSTGRES_URL is sourced exclusively from
+# environment variables (Kubernetes Secrets / Vault). Pool sizes and timeouts
+# are non-secret defaults.
+database:
+  url: ""                                       # env: POSTGRES_URL                       (REQUIRED at runtime; fail-fast at startup if missing per AAP R-19)
+  pool_min_size: 2                              # env: POSTGRES_POOL_MIN_SIZE
+  pool_max_size: 10                             # env: POSTGRES_POOL_MAX_SIZE
+  pool_timeout_seconds: 10                      # env: POSTGRES_POOL_TIMEOUT_SECONDS
+  statement_timeout_ms: 5000                    # env: POSTGRES_STATEMENT_TIMEOUT_MS
+  lock_timeout_ms: 2000                         # env: POSTGRES_LOCK_TIMEOUT_MS
+  idle_in_txn_timeout_ms: 5000                  # env: POSTGRES_IDLE_IN_TXN_TIMEOUT_MS
+  application_name: user-service                # env: POSTGRES_APPLICATION_NAME          (propagated to PostgreSQL pg_stat_activity for diagnostics)
+  sslmode: verify-full                          # env: POSTGRES_SSLMODE                   (production default; relax to "prefer" only in local dev)
+  ssl_root_cert: ""                             # env: POSTGRES_SSL_ROOT_CERT             (path to CA bundle when sslmode=verify-full; populated by deployment)
+
+# --- Groups C+D+E: Kafka (Producer + Consumer + Topics; AAP R-14, R-15, R-17, R-30) ---
+# NO Kafka SASL credentials here per AAP R-25; SASL is enabled by setting
+# KAFKA_SECURITY_PROTOCOL=SASL_SSL and supplying KAFKA_SASL_USERNAME /
+# KAFKA_SASL_PASSWORD via env at runtime.
+kafka:
+  bootstrap_servers: kafka:9092                 # env: KAFKA_BOOTSTRAP_SERVERS
+  security_protocol: PLAINTEXT                  # env: KAFKA_SECURITY_PROTOCOL            (PLAINTEXT for local; SASL_SSL in prod)
+  sasl_mechanism: ""                            # env: KAFKA_SASL_MECHANISM               (e.g., SCRAM-SHA-512; empty for PLAINTEXT)
+  sasl_username: ""                             # env: KAFKA_SASL_USERNAME                (secret in higher environments)
+  sasl_password: ""                             # env: KAFKA_SASL_PASSWORD                (secret in higher environments)
+  ssl_ca_location: ""                           # env: KAFKA_SSL_CA_LOCATION
+  client_id: user-service                       # env: KAFKA_CLIENT_ID
+
+  # --- Producer (AAP R-15) ---
+  producer:
+    acks: all                                   # env: KAFKA_PRODUCER_ACKS                                          (durable writes per AAP R-15)
+    enable_idempotence: true                    # env: KAFKA_PRODUCER_ENABLE_IDEMPOTENCE                            (safe retries; required for outbox correctness)
+    compression_type: zstd                      # env: KAFKA_PRODUCER_COMPRESSION_TYPE                              (best ratio with reasonable CPU)
+    linger_ms: 20                               # env: KAFKA_PRODUCER_LINGER_MS
+    batch_size_bytes: 65536                     # env: KAFKA_PRODUCER_BATCH_SIZE_BYTES
+    request_timeout_ms: 30000                   # env: KAFKA_PRODUCER_REQUEST_TIMEOUT_MS
+    delivery_timeout_ms: 120000                 # env: KAFKA_PRODUCER_DELIVERY_TIMEOUT_MS
+    max_in_flight_requests_per_connection: 5    # env: KAFKA_PRODUCER_MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION
+    retries: 2147483647                         # env: KAFKA_PRODUCER_RETRIES                                       (rely on delivery_timeout_ms to bound)
+    retry_backoff_ms: 200                       # env: KAFKA_PRODUCER_RETRY_BACKOFF_MS
+
+  # --- Consumer (AAP R-15, R-17) ---
+  consumer:
+    group_id: user-service                      # env: KAFKA_GROUP_ID                                               (single consumer group; matches sibling convention)
+    enable_auto_commit: false                   # env: KAFKA_ENABLE_AUTO_COMMIT                                     (manual commit AFTER durable write; at-least-once)
+    auto_offset_reset: earliest                 # env: KAFKA_AUTO_OFFSET_RESET
+    session_timeout_ms: 30000                   # env: KAFKA_SESSION_TIMEOUT_MS
+    heartbeat_interval_ms: 10000                # env: KAFKA_HEARTBEAT_INTERVAL_MS
+    max_poll_interval_ms: 300000                # env: KAFKA_MAX_POLL_INTERVAL_MS
+    fetch_min_bytes: 1024                       # env: KAFKA_FETCH_MIN_BYTES
+    fetch_max_bytes: 10485760                   # env: KAFKA_FETCH_MAX_BYTES
+    max_poll_records: 100                       # env: KAFKA_MAX_POLL_RECORDS
+    retry_backoff_ms: 200                       # env: KAFKA_CONSUMER_RETRY_BACKOFF_MS
+
+  # --- Topics (AAP R-30; <domain>.<verb>) ---
+  topics:
+    consumed:
+      user_registered: user.registered          # env: KAFKA_TOPIC_USER_REGISTERED        (consumed FROM Auth Service)
+    produced:
+      user_updated: user.updated                # env: KAFKA_TOPIC_USER_UPDATED           (produced FOR Notification, Recommendation)
+      user_deleted: user.deleted                # env: KAFKA_TOPIC_USER_DELETED           (produced on soft-delete)
+
+  # --- Retry + DLQ (AAP R-17) ---
+  retry_topic_suffix: .retry                    # env: KAFKA_RETRY_TOPIC_SUFFIX           (e.g., user.registered.retry)
+  dlq_topic_suffix: .dlq                        # env: KAFKA_DLQ_TOPIC_SUFFIX             (e.g., user.registered.dlq)
+
+  # --- Consumer retry policy (AAP R-15) ---
+  consumer_retry:
+    max_attempts: 5                             # env: KAFKA_CONSUMER_RETRY_MAX_ATTEMPTS
+    initial_delay_seconds: 2                    # env: KAFKA_CONSUMER_RETRY_INITIAL_DELAY_SECONDS
+    max_delay_seconds: 60                       # env: KAFKA_CONSUMER_RETRY_MAX_DELAY_SECONDS
+    multiplier: 2.0                             # env: KAFKA_CONSUMER_RETRY_MULTIPLIER
+    jitter_fraction: 0.2                        # env: KAFKA_CONSUMER_RETRY_JITTER_FRACTION
+
+# --- Group F: Schema Registry (AAP R-14) ------------------------------------
+# NO Schema Registry auth credentials here per AAP R-25; supplied via
+# SCHEMA_REGISTRY_AUTH_USER / SCHEMA_REGISTRY_AUTH_PASS env vars.
+schema_registry:
+  url: http://schema-registry:8081              # env: SCHEMA_REGISTRY_URL
+  auth_user: ""                                 # env: SCHEMA_REGISTRY_AUTH_USER          (secret in higher environments)
+  auth_pass: ""                                 # env: SCHEMA_REGISTRY_AUTH_PASS          (secret in higher environments)
+  request_timeout_seconds: 10                   # env: SCHEMA_REGISTRY_REQUEST_TIMEOUT_SECONDS
+  auto_register_schemas: false                  # env: SCHEMA_REGISTRY_AUTO_REGISTER_SCHEMAS  (AAP R-14 — schemas managed via infrastructure/kafka/schemas/)
+  subjects:
+    user_registered: user.registered-value      # env: SCHEMA_REGISTRY_SUBJECT_USER_REGISTERED
+    user_updated: user.updated-value            # env: SCHEMA_REGISTRY_SUBJECT_USER_UPDATED
+    user_deleted: user.deleted-value            # env: SCHEMA_REGISTRY_SUBJECT_USER_DELETED
+
+# --- Group G: Auth / JWT Validation (AAP R-21, R-22, R-23) ------------------
+# Auth Service is the SOLE issuer of JWTs (AAP R-21); this service only
+# validates them. JWKS is fetched from JWT_PUBLIC_KEY_URL and cached with
+# bounded TTL (AAP R-22).
+auth:
+  auth_service_url: http://auth-service:8000                    # env: AUTH_SERVICE_URL
+  jwt_public_key_url: http://auth-service:8000/.well-known/jwks.json   # env: JWT_PUBLIC_KEY_URL          (JWKS endpoint per AAP R-22)
+  issuer: https://auth.example.com              # env: JWT_ISSUER                         (placeholder; override per env)
+  audience: user-service                        # env: JWT_AUDIENCE                       (must match the `aud` claim issued by Auth Service for this service)
+  allowed_algorithms:                           # env: JWT_ALLOWED_ALGORITHMS             (comma-separated env override; here as YAML list for clarity)
+    - RS256
+    - EdDSA
+  leeway_seconds: 30                            # env: JWT_LEEWAY_SECONDS                 (clock-skew tolerance on exp/nbf)
+  jwks:
+    cache_ttl_seconds: 600                      # env: JWKS_CACHE_TTL_SECONDS             (10 minutes — bounded TTL per AAP R-22)
+    cache_max_keys: 16                          # env: JWKS_CACHE_MAX_KEYS                (prevents unbounded JWKS cache growth)
+  required_scopes:
+    user_read:                                  # env: JWT_REQUIRED_SCOPES_USER_READ      (comma-separated env override; here as YAML list)
+      - users:read
+      - users:self
+    user_write:                                 # env: JWT_REQUIRED_SCOPES_USER_WRITE
+      - users:write
+      - users:self
+    user_admin:                                 # env: JWT_REQUIRED_SCOPES_USER_ADMIN
+      - users:admin
+
+# --- Group H: User-Service-Specific Domain Configuration --------------------
+# Domain knobs that govern the User Service's business logic. These are
+# user-service-specific and have no peer in sibling services.
+user_domain:
+  soft_delete_enabled: true                     # env: USER_SOFT_DELETE_ENABLED                  (DELETE /users/me sets deleted_at + anonymizes PII)
+  pii_anonymization_hash_salt: ""               # env: USER_PII_ANONYMIZATION_HASH_SALT          (SECRET — used to derive hash-stable PII placeholders; runtime env only)
+
+  # --- Defaults applied to new users (AAP R-11 — channel preferences) ---
+  defaults:
+    locale: en-US                               # env: USER_DEFAULT_LOCALE
+    currency: USD                               # env: USER_DEFAULT_CURRENCY
+    timezone: UTC                               # env: USER_DEFAULT_TIMEZONE
+    email_opt_in: true                          # env: USER_DEFAULT_EMAIL_OPT_IN                 (email is the primary default channel)
+    sms_opt_in: false                           # env: USER_DEFAULT_SMS_OPT_IN                   (SMS opt-in by default — AAP R-11 + cost control)
+    marketing_opt_in: false                     # env: USER_DEFAULT_MARKETING_OPT_IN
+
+  # --- Field length limits (defensive against malformed payloads) ---
+  max_addresses_per_user: 20                    # env: USER_MAX_ADDRESSES_PER_USER
+  max_phone_length: 32                          # env: USER_MAX_PHONE_LENGTH
+  max_display_name_length: 120                  # env: USER_MAX_DISPLAY_NAME_LENGTH
+  max_avatar_url_length: 2048                   # env: USER_MAX_AVATAR_URL_LENGTH
+  allowed_avatar_hosts: ""                      # env: USER_ALLOWED_AVATAR_HOSTS                 (comma-separated; empty = allow any HTTPS host)
+
+  # --- Validation regions / formats ---
+  phone_validation_region: US                   # env: USER_PHONE_VALIDATION_REGION              (default region for libphonenumber)
+
+  # --- Date-of-birth bounds (COPPA / GDPR child protection) ---
+  date_of_birth:
+    min_age_years: 13                           # env: USER_DATE_OF_BIRTH_MIN_AGE_YEARS          (COPPA / GDPR child-protection floor)
+    max_age_years: 130                          # env: USER_DATE_OF_BIRTH_MAX_AGE_YEARS          (sanity ceiling; reject implausibly old DOBs)
+
+  # --- Per-user write rate limits ---
+  rate_limits:
+    profile_updates_per_minute: 20              # env: USER_PROFILE_UPDATE_RATE_LIMIT_PER_MINUTE
+    preferences_updates_per_minute: 20          # env: USER_PREFERENCES_UPDATE_RATE_LIMIT_PER_MINUTE
+    addresses_updates_per_minute: 20            # env: USER_ADDRESSES_UPDATE_RATE_LIMIT_PER_MINUTE
+
+# --- Group I: Outbox Dispatcher ---------------------------------------------
+# The outbox pattern guarantees write-then-publish atomicity: domain events
+# are written to an `events_outbox` table inside the same transaction as the
+# data change; this background dispatcher publishes outbox rows to Kafka and
+# marks them published. Without this, a successful Postgres write followed by
+# a Kafka producer failure would create event drift.
+outbox:
+  dispatch_interval_ms: 500                     # env: OUTBOX_DISPATCH_INTERVAL_MS               (poll every 500ms for fast event visibility)
+  dispatch_batch_size: 100                      # env: OUTBOX_DISPATCH_BATCH_SIZE                (max events published per tick)
+  max_retries: 10                               # env: OUTBOX_DISPATCH_MAX_RETRIES               (retries before parking row for forensic review)
+  retention_days: 14                            # env: OUTBOX_RETENTION_DAYS                     (successful events purged after retention window)
+  failed_retention_days: 90                     # env: OUTBOX_FAILED_RETENTION_DAYS              (failed/DLQed rows kept for forensics)
+
+# --- Group J: Outbound HTTP (AAP R-15, R-16) --------------------------------
+# Applies to all outbound HTTP calls (e.g., JWKS fetch from Auth Service for
+# JWT validation per AAP R-22). Every call must have a timeout, retry policy,
+# and circuit breaker in front of it.
+http_client:
+  user_agent: user-service/1.0                  # env: HTTP_CLIENT_USER_AGENT
+  default_timeout_seconds: 10                   # env: HTTP_CLIENT_DEFAULT_TIMEOUT_SECONDS
+  connect_timeout_seconds: 3                    # env: HTTP_CLIENT_CONNECT_TIMEOUT_SECONDS
+
+  # --- Retry policy (AAP R-15) ---
+  retry:
+    max_attempts: 3                             # env: HTTP_CLIENT_RETRY_MAX_ATTEMPTS
+    initial_delay_ms: 200                       # env: HTTP_CLIENT_RETRY_INITIAL_DELAY_MS
+    multiplier: 2.0                             # env: HTTP_CLIENT_RETRY_MULTIPLIER
+    max_delay_ms: 5000                          # env: HTTP_CLIENT_RETRY_MAX_DELAY_MS
+    jitter_fraction: 0.2                        # env: HTTP_CLIENT_RETRY_JITTER_FRACTION
+
+  # --- Circuit breaker (AAP R-16) ---
+  circuit_breaker:
+    failure_threshold: 10                       # env: HTTP_CLIENT_CB_FAILURE_THRESHOLD          (consecutive failures before opening)
+    failure_rate: 0.5                           # env: HTTP_CLIENT_CB_FAILURE_RATE               (50% failure rate over rolling window)
+    open_duration_seconds: 30                   # env: HTTP_CLIENT_CB_OPEN_DURATION_SECONDS      (wait before half-open probe)
+    half_open_probes: 1                         # env: HTTP_CLIENT_CB_HALF_OPEN_PROBES           (probe call budget)
+
+# --- Group K: Health Probes (AAP R-19) --------------------------------------
+health:
+  liveness_path: /health/live                   # env: HEALTH_LIVE_PATH                          (process-alive probe)
+  readiness_path: /health/ready                 # env: HEALTH_READY_PATH                         (matches Dockerfile HEALTHCHECK target)
+  ready_dependencies:                           # env: HEALTH_READY_DEPENDENCIES                 (comma-separated env override; here as YAML list)
+    - postgres
+    - kafka_producer
+    - kafka_consumer
+    - schema_registry
+  fail_fast_on_startup: true                    # env: HEALTH_READY_FAIL_FAST_ON_STARTUP         (AAP R-19 — exit if critical deps unreachable at startup)
+
+# --- Group L: Observability (OTel + Prometheus + Correlation; AAP R-13, R-26, R-27) ---
+observability:
+  # --- OpenTelemetry ---
+  otel:
+    service_name: user-service                  # env: OTEL_SERVICE_NAME
+    resource_attributes: service.namespace=ecommerce,service.version=0.1.0   # env: OTEL_RESOURCE_ATTRIBUTES   (deployment.environment appended at runtime)
+    exporter_otlp_endpoint: ""                  # env: OTEL_EXPORTER_OTLP_ENDPOINT               (empty = OTel disabled in local dev; supply OTLP collector URL in cluster envs)
+    exporter_otlp_protocol: grpc                # env: OTEL_EXPORTER_OTLP_PROTOCOL               (grpc | http/protobuf)
+    traces_exporter: otlp                       # env: OTEL_TRACES_EXPORTER
+    metrics_exporter: otlp                      # env: OTEL_METRICS_EXPORTER
+    traces_sampler: parentbased_traceidratio    # env: OTEL_TRACES_SAMPLER                       (head-based sampler honoring upstream sampling decision)
+    traces_sampler_arg: 0.1                     # env: OTEL_TRACES_SAMPLER_ARG                   (10% sample rate for new traces)
+
+  # --- Prometheus (scraped by Metricbeat per AAP R-27) ---
+  prometheus:
+    metrics_path: /metrics                      # env: PROMETHEUS_METRICS_PATH
+    metrics_port: ""                            # env: PROMETHEUS_METRICS_PORT                   (empty = same as HTTP_PORT; set 9090 to expose separately)
+
+  # --- Correlation IDs (AAP R-13) ---
+  correlation_id:
+    header: X-Correlation-ID                    # env: CORRELATION_ID_HEADER                     (HTTP header name)
+    kafka_header: correlation_id                # env: CORRELATION_ID_KAFKA_HEADER               (Kafka message header name)
+
+# --- Group M: Feature Flags --------------------------------------------------
+feature_flags:
+  outbox_enabled: true                          # env: FEATURE_OUTBOX_ENABLED                    (write-then-publish atomicity for user.* events)
+  admin_api_enabled: true                       # env: FEATURE_ADMIN_API_ENABLED                 (mount /admin/* routes for support tooling)
+  pii_anonymization_on_soft_delete: true        # env: FEATURE_PII_ANONYMIZATION_ON_SOFT_DELETE  (DELETE /users/me anonymizes PII fields)
+  locale_autodetect: false                      # env: FEATURE_LOCALE_AUTODETECT                 (if true, default locale derived from request Accept-Language)
+
+# --- Group N: Database Migrations (Alembic) ---------------------------------
+migrations:
+  run_on_startup: true                          # env: RUN_MIGRATIONS_ON_STARTUP                 (alembic upgrade head before HTTP server starts)
+  dir: migrations                               # env: MIGRATIONS_DIR                            (path relative to /app inside the container)
+  table: alembic_version_user_service           # env: MIGRATIONS_TABLE                          (per-service version table to allow shared cluster)
+
+# =============================================================================
+# END OF DEFAULT CONFIGURATION
+# -----------------------------------------------------------------------------
+# Required env vars (no safe default — fail-fast at startup per AAP R-19):
+#   POSTGRES_URL                        — connection string for user_db
+#   KAFKA_BOOTSTRAP_SERVERS             — Kafka coordinates (default kafka:9092 above
+#                                          is for in-cluster development; production must override)
+#   SCHEMA_REGISTRY_URL                 — schema validation (AAP R-14)
+#   AUTH_SERVICE_URL                    — Auth Service location
+#   JWT_PUBLIC_KEY_URL                  — JWKS endpoint (AAP R-22)
+#   JWT_ISSUER                          — token validation (AAP R-23)
+#   USER_PII_ANONYMIZATION_HASH_SALT    — SECRET — required when soft-delete is enabled
+#
+# REMINDERS:
+#   * NO secrets in this file (AAP R-25 — env-var overlay only).
+#   * `kafka.consumer.enable_auto_commit` MUST stay false — User Service commits
+#     offsets only after durable Postgres writes for at-least-once semantics.
+#   * `kafka.producer.enable_idempotence` MUST stay true and `acks` MUST be all
+#     — user.updated/user.deleted events are observable from downstream consumers
+#     and must not be silently dropped.
+#   * `schema_registry.auto_register_schemas` MUST stay false — schemas are
+#     governed via infrastructure/kafka/schemas/ (AAP R-14).
+#   * The `user_domain:` and `outbox:` sections are UNIQUE to User Service —
+#     no other service has user-domain knobs or an outbox dispatcher of this shape.
+# =============================================================================
