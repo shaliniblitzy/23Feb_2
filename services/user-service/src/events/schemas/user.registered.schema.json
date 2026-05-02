@@ -1,0 +1,100 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://schemas.example.com/user.registered.schema.json",
+  "title": "user.registered",
+  "description": "Emitted by the Auth Service when a new user identity is successfully registered. Consumed by the User Service to provision the User aggregate idempotently keyed on `external_auth_id` (the OAuth/OIDC `sub` claim). Topic: user.registered. Partition key: user_id. Subject in Schema Registry: user.registered-value. Required fields are enforced; `additionalProperties` is false (the closed-world contract). Optional auth-issuer metadata fields (auth_provider, auth_issuer, auth_audience, email_verified, display_name, first_name, last_name, locale) MAY be supplied by the producer and are used by the User Service to seed initial profile and preference rows. Satisfies AAP R-14 (Schema Registry validated), R-23 (OAuth 2.0 / RFC 6749 conformant claims), R-30 (topic name mirrors event name), R-31 (version field for backward-compatible evolution), R-32 (producer does not enumerate consumers), R-33 (event is self-contained — User Service does NOT call back to Auth Service to interpret the event).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "version",
+    "user_id",
+    "external_auth_id",
+    "email",
+    "registered_at"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Globally unique identifier for this event instance. Used by the User Service as the idempotency key when processing the message."
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 1,
+      "description": "Event payload schema version per AAP R-31. Incremented when the schema evolves backward-compatibly. Consumers MUST tolerate values they do not yet know about."
+    },
+    "user_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "User aggregate identifier (UUID v4 or v7) assigned by the Auth Service on first registration. Used by the User Service as the primary key of the `users.users` table and as the partition key for all `user.*` Kafka events."
+    },
+    "external_auth_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "description": "Stable identifier from the auth issuer's `sub` (subject) claim per RFC 6749 / RFC 6750. UNIQUE upsert key for `users.external_auth_id`; enables idempotent provisioning so that re-delivered `user.registered` events do not create duplicate user rows."
+    },
+    "email": {
+      "type": "string",
+      "format": "email",
+      "minLength": 3,
+      "maxLength": 320,
+      "description": "User's primary email address at registration. Lowercase, RFC-5321/5322 validated. UNIQUE in `users.users.email`."
+    },
+    "registered_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 / ISO 8601 timestamp (UTC, with offset suffix) at which registration was completed at the auth issuer."
+    },
+    "auth_provider": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "description": "Optional. Authentication provider identifier (e.g., `password`, `google`, `github`, `okta`, `apple`). Used for analytics and to drive provider-specific onboarding flows."
+    },
+    "auth_issuer": {
+      "type": "string",
+      "format": "uri",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Optional. OIDC `iss` claim — the issuer URL identifying the authority that authenticated the user (e.g., `https://example.auth0.com/`)."
+    },
+    "auth_audience": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Optional. OIDC `aud` claim associated with the registration."
+    },
+    "email_verified": {
+      "type": "boolean",
+      "description": "Optional. Whether the email address was verified at the auth issuer at the time of registration. Drives downstream gating (e.g., transactional emails may be deferred until verification)."
+    },
+    "display_name": {
+      "type": "string",
+      "minLength": 0,
+      "maxLength": 120,
+      "description": "Optional. Display name from the OIDC `name` claim, when available. Seeds `user_profiles.display_name`."
+    },
+    "first_name": {
+      "type": "string",
+      "minLength": 0,
+      "maxLength": 120,
+      "description": "Optional. From the OIDC `given_name` claim, when available. Seeds `user_profiles.first_name`."
+    },
+    "last_name": {
+      "type": "string",
+      "minLength": 0,
+      "maxLength": 120,
+      "description": "Optional. From the OIDC `family_name` claim, when available. Seeds `user_profiles.last_name`."
+    },
+    "locale": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 35,
+      "pattern": "^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{1,8})*$",
+      "description": "Optional. BCP-47 locale tag from the auth provider's `locale` claim (e.g., `en-US`, `fr-FR`, `zh-Hant-TW`). Seeds `user_preferences.preferred_language`."
+    }
+  }
+}
