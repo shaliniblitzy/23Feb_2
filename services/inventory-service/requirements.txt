@@ -1,0 +1,210 @@
+# ============================================================================
+# Inventory Service — requirements.txt
+# ----------------------------------------------------------------------------
+# Stock reservation engine and warehouse-state owner for the e-commerce
+# platform. Owns inventory_db (PostgreSQL); produces inventory.reserved /
+# inventory.released / inventory.low-stock; consumes order.created /
+# order.cancelled / order.fulfilled.
+#
+# Architecture diagram: docs/architecture/system-diagram.md
+# Python:               3.11+
+# AAP refs:             0.3.3.2, 0.5.2.5, 0.6.1
+#
+# CONVENTION:
+#   - Pin to compatible-release (~=) on minor versions for runtime deps.
+#   - Test-only deps go in tests/requirements-dev.txt (created by the tests
+#     subfolder agent); this file holds runtime + transitive build deps only.
+#   - Do NOT add provider-specific SDKs (Stripe, Razorpay, SendGrid, Twilio,
+#     OpenAI, ML serving) here — those belong to other services.
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# 2.1 Web framework & ASGI server
+# ----------------------------------------------------------------------------
+# FastAPI exposes the synchronous inventory-management endpoints — POST
+# /inventory/reservations (reserve stock for a saga step), DELETE
+# /inventory/reservations/{id} (release reservation), GET /inventory/{sku}
+# (read current stock), GET /health/live, GET /health/ready, GET /metrics —
+# fronted by the API Gateway per AAP Section 0.5.1 (Mermaid edge:
+# `Gateway -->|REST /inventory| InventorySvc`). uvicorn[standard] adds
+# uvloop + httptools for production throughput; the Dockerfile CMD runs
+# `uvicorn ... --loop uvloop --http httptools`. starlette is the underlying
+# ASGI substrate of FastAPI and is pinned explicitly so security patches
+# resolve deterministically. python-multipart is required by FastAPI to
+# parse multipart/form-data bodies on admin endpoints.
+# ----------------------------------------------------------------------------
+fastapi~=0.115.0
+uvicorn[standard]~=0.32.0
+starlette~=0.41.0          # FastAPI dep; pin explicitly for security tracking
+python-multipart~=0.0.12   # form parsing for admin endpoints
+
+
+# ----------------------------------------------------------------------------
+# 2.2 Configuration & validation
+# ----------------------------------------------------------------------------
+# Pydantic v2 powers request/response validation AND validates the Kafka
+# event payloads emitted by the reservation engine (inventory.reserved,
+# inventory.released, inventory.low-stock). pydantic-settings drives
+# 12-factor environment-variable configuration loading and fails fast on
+# missing required variables per AAP R-19.
+# ----------------------------------------------------------------------------
+pydantic~=2.9.0
+pydantic-settings~=2.6.0
+
+
+# ----------------------------------------------------------------------------
+# 2.3 PostgreSQL (inventory_db owner) — AAP Section 0.4.4, R-6, R-9
+# ----------------------------------------------------------------------------
+# psycopg v3 is the consistent monorepo PostgreSQL driver choice (NOT
+# psycopg2) — async-first design, better connection pooling, and active
+# upstream maintenance. The [binary,pool] extras provide the bundled libpq
+# wheel + ConnectionPool implementation, eliminating the need for a system
+# libpq install in the runtime container. SQLAlchemy v2 sits above psycopg
+# v3 as the typed ORM / query builder for the inventory tables
+# (stock_items, reservations, warehouses, stock_movements). Alembic is the
+# declarative migration runner satisfying AAP R-9 (migrations live under
+# `services/inventory-service/migrations/` and are applied on startup).
+# ----------------------------------------------------------------------------
+psycopg[binary,pool]~=3.2.0
+sqlalchemy~=2.0.36
+alembic~=1.14.0
+
+
+# ----------------------------------------------------------------------------
+# 2.4 Apache Kafka (event backbone) — AAP R-14, R-17, R-30
+# ----------------------------------------------------------------------------
+# confluent-kafka wraps librdkafka for high-throughput produce + consume;
+# the [avro,schemaregistry,json] extras stream events through Schema
+# Registry per AAP R-14 to enforce backward-compatible schema evolution.
+# fastavro is the compiled Avro serializer used by the Schema Registry
+# Avro encoder.
+#
+# The Inventory Service plays a dual role on the Kafka bus per AAP
+# Section 0.4.2:
+#   - Producer: inventory.reserved, inventory.released, inventory.low-stock
+#   - Consumer: order.created, order.cancelled, order.fulfilled
+# Both DLQ and retry topic patterns are realized in the consumer
+# scaffolding via this same client (AAP R-17).
+# ----------------------------------------------------------------------------
+confluent-kafka[avro,schemaregistry,json]~=2.6.0
+fastavro~=1.9.0
+
+
+# ----------------------------------------------------------------------------
+# 2.5 HTTP client + Resilience — AAP R-15, R-16
+# ----------------------------------------------------------------------------
+# httpx is the async-first HTTP client (HTTP/2, connection pooling,
+# explicit timeouts) used for read-side lookups and JWKS fetches. tenacity
+# implements retry-with-exponential-backoff + jitter + bounded attempts
+# (AAP R-15). pybreaker implements the circuit breaker state machine
+# (open / half-open / closed) with configurable failure thresholds (AAP
+# R-16). Inventory Service has no current synchronous outbound HTTP, but
+# this triad is reserved as the production-hardened scaffolding for
+# future external warehouse adapters (e.g., ExternalWMSWarehouseAdapter).
+# ----------------------------------------------------------------------------
+httpx~=0.27.0
+tenacity~=9.0.0
+pybreaker~=1.2.0
+
+
+# ----------------------------------------------------------------------------
+# 2.6 Auth: JWT validation via JWKS — AAP R-21, R-22, R-23
+# ----------------------------------------------------------------------------
+# Inventory Service is a JWT *consumer*, not an issuer (only Auth Service
+# may mint tokens per AAP R-21). pyjwt[crypto] includes the cryptography
+# transitive needed for RS256/ES256 signature verification — the typical
+# JWKS algorithms. cachetools provides the bounded TTL cache that holds
+# JWKS keys per AAP R-22 (key rotation must not require service restart).
+# ----------------------------------------------------------------------------
+pyjwt[crypto]~=2.9.0
+cachetools~=5.5.0
+
+
+# ----------------------------------------------------------------------------
+# 2.7 Observability — AAP R-26, R-27, R-28
+# ----------------------------------------------------------------------------
+# structlog + python-json-logger emit the structured JSON log lines
+# required by AAP R-26 (timestamp, level, service, correlation_id,
+# user_id, route, method, status, latency_ms, message). prometheus-client
+# exposes the /metrics endpoint scraped by Metricbeat per AAP R-27.
+#
+# OpenTelemetry is the unified tracing + metrics fan-out: the API
+# (vendor-neutral instrumentation contract), the SDK (span processors,
+# samplers), and the OTLP exporter that ships traces to a collector that
+# in turn fans out to Elasticsearch via the Logstash pipeline.
+#
+# The instrumentation set covers every cross-cutting hop:
+#   - opentelemetry-instrumentation-fastapi      — incoming HTTP requests
+#   - opentelemetry-instrumentation-httpx        — outgoing HTTP (JWKS,
+#                                                  read-side lookups)
+#   - opentelemetry-instrumentation-sqlalchemy   — every DB query
+#   - opentelemetry-instrumentation-logging      — log/trace correlation
+#                                                  (injects trace_id +
+#                                                  span_id into log
+#                                                  records for AAP R-13)
+# ----------------------------------------------------------------------------
+structlog~=24.4.0
+python-json-logger~=2.0.7
+prometheus-client~=0.21.0
+opentelemetry-api~=1.27.0
+opentelemetry-sdk~=1.27.0
+opentelemetry-exporter-otlp~=1.27.0
+opentelemetry-instrumentation-fastapi~=0.48b0
+opentelemetry-instrumentation-httpx~=0.48b0
+opentelemetry-instrumentation-sqlalchemy~=0.48b0
+opentelemetry-instrumentation-logging~=0.48b0
+
+
+# ----------------------------------------------------------------------------
+# 2.8 Standard utilities
+# ----------------------------------------------------------------------------
+# python-dotenv loads .env files in local development only; production
+# uses Kubernetes Secrets per AAP R-25 (no secrets in source). orjson is
+# the fastest JSON serializer available — used by FastAPI's
+# ORJSONResponse and by the Kafka event payload encoder. pyyaml parses
+# config/default.yaml (the per-service configuration file referenced in
+# AAP Section 0.4.3). python-dateutil provides timezone-aware ISO-8601
+# parsing for inventory event timestamps and reservation deadlines.
+# cryptography supplies TLS primitives + RS256/ES256 signature
+# verification used by pyjwt (AAP R-22, R-24). typing-extensions backports
+# typing features needed by older transitive libraries on Python 3.11.
+# anyio supplies the structured-concurrency primitives that uvicorn's
+# worker pool and FastAPI's sync-route thread offload rely on.
+# ----------------------------------------------------------------------------
+python-dotenv~=1.0.1       # load .env in local dev only
+orjson~=3.10.0             # fastest JSON for log + event payloads
+pyyaml~=6.0.2              # parse config/default.yaml
+python-dateutil~=2.9.0     # robust datetime parsing for event timestamps
+cryptography~=43.0.0       # TLS, JWT signature verification (AAP R-24)
+typing-extensions~=4.12.0  # backports for any older library
+anyio~=4.6.0               # structured concurrency primitives (uvicorn worker pool)
+
+
+# ----------------------------------------------------------------------------
+# 2.9 Inventory-specific: reservation expiry scheduler — AAP R-20
+# ----------------------------------------------------------------------------
+# apscheduler provides the cron-style background scheduler that
+# periodically scans for expired reservations (i.e., reservations whose
+# saga step never completed within the configured deadline) and emits
+# `inventory.released` events with `expired=true`. This realizes the AAP
+# R-20 fallback for stuck sagas — without it, abandoned checkout flows
+# would permanently lock stock and cause operational silent-failure modes.
+# This package is INVENTORY-UNIQUE in the monorepo; no sibling service
+# runs a comparable in-process scheduler.
+# ----------------------------------------------------------------------------
+apscheduler~=3.10.4
+
+
+# ============================================================================
+# End of requirements.txt — for test deps see tests/requirements-dev.txt
+# (created by the tests/ subfolder agent).
+#
+# When updating versions:
+#   1. Bump only the patch component within a minor unless deliberate; major
+#      bumps require a documented validation pass against the e-commerce
+#      contract tests in tests/contract/.
+#   2. Run pip-compile or pip install -r requirements.txt --dry-run to detect
+#      transitive conflicts.
+#   3. Re-build the Docker image to confirm wheels build cleanly.
+# ============================================================================
