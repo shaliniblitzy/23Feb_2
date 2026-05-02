@@ -1,0 +1,61 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://schemas.example.com/user.deleted.schema.json",
+  "title": "user.deleted",
+  "description": "Emitted by the User Service when a user is soft-deleted (typical trigger: GDPR right-to-be-forgotten). Consumed by Notification Service (suppress further sends) and Recommendation Engine (purge per-user derived state). Topic: user.deleted. Partition key: user_id. Subject in Schema Registry: user.deleted-value. Satisfies AAP R-30 (topic name mirrors event name), R-31 (version field for backward-compatible evolution), R-32 (producer does not enumerate consumers), R-33 (event is self-contained — no callback to the producer required).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "version",
+    "user_id",
+    "external_auth_id",
+    "deleted_at",
+    "reason"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Globally unique identifier for this event instance. Used by consumers as the idempotency key when processing the message."
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 1,
+      "description": "Event payload schema version per AAP R-31. Incremented when the schema evolves backward-compatibly. Consumers MUST tolerate values they do not yet know about."
+    },
+    "user_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "User aggregate identifier whose lifecycle ended. Stable for the lifetime of the user. Equals the `id` column of `users.users` and the partition key of all `user.*` Kafka events."
+    },
+    "external_auth_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "description": "Stable identifier from the Auth Service `sub` (subject) claim. Carried so downstream services can correlate with auth-side state and propagate the deletion to systems that index on the external identifier."
+    },
+    "deleted_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 / ISO 8601 timestamp (UTC, with offset suffix) at which the soft-delete was committed in the User Service. Mirrors the `users.deleted_at` column."
+    },
+    "reason": {
+      "type": "string",
+      "enum": [
+        "USER_REQUESTED",
+        "ADMIN_DELETED",
+        "GDPR_RIGHT_TO_BE_FORGOTTEN",
+        "ACCOUNT_INACTIVE",
+        "TERMS_VIOLATION"
+      ],
+      "description": "Canonical reason code that drives downstream cleanup behavior. USER_REQUESTED: customer-initiated deletion. ADMIN_DELETED: removed via support tooling by an authorized operator. GDPR_RIGHT_TO_BE_FORGOTTEN: regulatory data-erasure request — downstream services MUST purge derived state. ACCOUNT_INACTIVE: long-dormant cleanup by a scheduled job. TERMS_VIOLATION: trust-and-safety enforcement action."
+    },
+    "user_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Optional. Optimistic-concurrency token (the `version` column of `users.users`) at the moment the deletion was committed. Allows consumers to discard stale `user.updated` events that arrive after this delete due to out-of-order delivery."
+    }
+  }
+}
