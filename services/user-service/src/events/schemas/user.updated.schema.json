@@ -1,0 +1,101 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://schemas.example.com/user.updated.schema.json",
+  "title": "user.updated",
+  "description": "Emitted by the User Service whenever a profile, preferences, or address change is durably persisted. Consumed by Notification Service (channel-preference re-evaluation) and Recommendation Engine (per-user feature refresh). The full user envelope (id, external_auth_id, email, status) is denormalized so consumers do not need to call back to the User Service. Topic: user.updated. Partition key: user_id. Subject in Schema Registry: user.updated-value. Satisfies AAP R-30 (topic name mirrors event name), R-31 (version field for backward-compatible evolution), R-32 (producer does not enumerate consumers), R-33 (event is self-contained).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "version",
+    "user_id",
+    "external_auth_id",
+    "email",
+    "status",
+    "changes",
+    "updated_at"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Globally unique identifier for this event instance. Used by consumers as the idempotency key when processing the message."
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 1,
+      "description": "Event payload schema version per AAP R-31. Incremented when the schema evolves backward-compatibly."
+    },
+    "user_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "User aggregate identifier. Equals the `id` column of `users.users` and the partition key for all `user.*` Kafka events; guarantees per-user strict ordering across topics."
+    },
+    "external_auth_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "description": "Stable identifier from the Auth Service `sub` (subject) claim. Carried so downstream services can correlate with auth-side state without calling back to the User Service."
+    },
+    "email": {
+      "type": "string",
+      "format": "email",
+      "minLength": 3,
+      "maxLength": 320,
+      "description": "User's primary email address AFTER the update (post-change value). Lowercase, RFC-5321/5322 validated. Carried as part of the denormalized user envelope per AAP R-33."
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "active",
+        "suspended",
+        "deleted"
+      ],
+      "description": "User lifecycle status AFTER the update. Mirrors the `users.status` column. `active`: normal account; `suspended`: temporarily disabled (login blocked, profile preserved); `deleted`: soft-deleted (anonymized; emits a separate `user.deleted` event)."
+    },
+    "user_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Optional. Optimistic-concurrency token (the `version` column of the user aggregate) AFTER the update was applied. Allows consumers to detect stale events when out-of-order delivery occurs."
+    },
+    "changes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "changed_fields"
+      ],
+      "description": "Structural description of what changed in this update.",
+      "properties": {
+        "changed_fields": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "minItems": 1,
+          "maxItems": 100,
+          "uniqueItems": true,
+          "description": "Dot-notation paths of fields that changed (e.g., `profile.first_name`, `preferences.email_opt_in`, `addresses.<address_uuid>.line1`, `addresses.added`, `addresses.removed`). Sourced from the User aggregate's ProfileChange / PreferencesChange / AddressChange tuples."
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "profile",
+            "preferences",
+            "address_added",
+            "address_updated",
+            "address_removed"
+          ],
+          "description": "Optional. High-level category enabling consumer-side filtering without parsing dot paths. The producer emits one event per category when multiple categories change in a single transaction."
+        }
+      }
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 / ISO 8601 timestamp (UTC, with offset suffix) at which the update transaction was committed. Mirrors the `users.updated_at` column AFTER the update."
+    }
+  }
+}
